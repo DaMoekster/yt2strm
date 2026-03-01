@@ -1,0 +1,21 @@
+services:
+  yt2strm:
+    build: .
+    container_name: yt2strm
+    environment:
+      - YT2STRM_URL=http://192.168.3.109:5000 # ← CHANGE THIS
+      - YT2STRM_MEDIA=/media
+      - YT2STRM_DATA=/data
+      - YT2STRM_INTERVAL=3600
+      - YT2STRM_LIMIT=20000
+      - YT2STRM_MODE=bridge  # Use bridge mode for high-quality with ffmpeg muxing
+      - YT2STRM_PLAY_HEIGHT=480  # Force 720p in play/bridge mode (0=auto, 360/480/720/1080)
+    volumes:
+      - yt2strm-data:/data
+      - E:/YOUTUBEstrms:/media
+    ports:
+      - 5000:5000
+    restart: unless-stopped
+volumes:
+  yt2strm-data: null
+networks: {}
