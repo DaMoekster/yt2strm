@@ -49,7 +49,7 @@ state = {
 def add_log(msg, level='info'):
     ts = datetime.now().strftime('%H:%M:%S')
     state['logs'].append({'time': ts, 'msg': msg, 'level': level})
-    state['logs'] = state['logs'][-200:]
+    state['logs'] = state['logs'][-500:]  # Keep more logs for detailed scanning
     getattr(logger, level, logger.info)(msg)
 
 # ── Channel persistence ─────────────────────────────────────────
@@ -279,8 +279,11 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
     new_count = 0
     meta_count = 0
     thumb_count = 0
+    total_entries = len([e for e in entries if e and (e.get('id') or e.get('url'))])
 
-    for entry in entries:
+    add_log(f'  Found {total_entries} videos to process')
+
+    for idx, entry in enumerate(entries, 1):
         if not entry:
             continue
         vid_id    = entry.get('id') or entry.get('url') or ''
@@ -295,8 +298,11 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                 with open(strm_path, 'w', encoding='utf-8') as f:
                     f.write(f'{EXTERNAL_URL}/{endpoint}/{vid_id}')
                 new_count += 1
+                add_log(f'  [{idx}/{total_entries}] Created: {vid_title}.strm')
             except OSError as e:
-                add_log(f'Write error {vid_title}: {e}', 'error')
+                add_log(f'  [{idx}/{total_entries}] Write error {vid_title}: {e}', 'error')
+        else:
+            add_log(f'  [{idx}/{total_entries}] Exists: {vid_title}.strm')
 
         # ── Metadata (NFO + thumbnail) ───────────────────────────
         if METADATA:
@@ -353,20 +359,20 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                             description
                         )
                     meta_count += 1
+                    add_log(f'      + NFO metadata')
                 except Exception as e:
-                    add_log(f'NFO error {vid_title}: {e}', 'error')
+                    add_log(f'      NFO error: {e}', 'error')
 
             thumb_path = os.path.join(channel_dir, f'{vid_title}-thumb.jpg')
             if not os.path.exists(thumb_path):
                 try:
                     if download_thumbnail(vid_id, thumb_path):
                         thumb_count += 1
+                        add_log(f'      + Thumbnail')
                 except Exception as e:
-                    add_log(f'Thumb error {vid_title}: {e}', 'error')
+                    add_log(f'      Thumb error: {e}', 'error')
 
-    if METADATA and (meta_count > 0 or thumb_count > 0):
-        add_log(f'  Metadata: {meta_count} nfo, {thumb_count} thumbs')
-
+    add_log(f'  Summary: {new_count} new STRM files, {meta_count} NFO files, {thumb_count} thumbnails')
     return new_count, name
 
 def run_full_scan():
@@ -384,15 +390,15 @@ def run_full_scan():
         content_type = ch.get('content_type', 'movie')  # default to movie if not specified
         if folder:
             label = f'{folder}/{label}'
-        add_log(f'[{i+1}/{len(channels)}] {label}')
+        add_log(f'[{i+1}/{len(channels)}] Scanning: {label}')
         try:
             count, resolved = scan_channel(ch['url'], ch.get('name'), folder, content_type)
             display = f'{folder}/{resolved}' if folder else resolved
             state['results'].append({'channel': display, 'new': count, 'status': 'ok'})
-            add_log(f'  ✓ {display}: {count} new')
+            add_log(f'[{i+1}/{len(channels)}] ✓ {display} complete')
         except Exception as e:
             state['results'].append({'channel': label, 'error': str(e), 'status': 'error'})
-            add_log(f'  ✗ {e}', 'error')
+            add_log(f'[{i+1}/{len(channels)}] ✗ Error: {e}', 'error')
 
     state['scanning'] = False
     state['last_scan'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -831,7 +837,7 @@ HTML = r"""<!DOCTYPE html>
   .ch-folder{display:inline-block;padding:.1rem .45rem;border-radius:3px;font-size:.7rem;
              font-weight:600;background:#2a2640;color:#a78bfa;margin-right:.5rem}
   .ch-actions{display:flex;gap:.3rem;flex-shrink:0}
-  .log-box{background:#0a0c12;border-radius:6px;padding:.7rem;max-height:250px;
+  .log-box{background:#0a0c12;border-radius:6px;padding:.7rem;max-height:400px;
            overflow-y:auto;font-family:monospace;font-size:.78rem;line-height:1.6}
   .log-line .t{color:var(--muted)}
   .log-line .e{color:var(--red)}
