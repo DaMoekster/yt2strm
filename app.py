@@ -21,7 +21,7 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger('yt2strm')
 
-VERSION = '1.1.0'  # Version number
+VERSION = '0.1.0'  # Version number
 
 # ── Config from environment ──────────────────────────────────────
 HOST         = os.environ.get('YT2STRM_HOST', '0.0.0.0')
