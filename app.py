@@ -117,12 +117,16 @@ def download_image(url, dest_path):
         pass
     return False
 
-def write_movie_nfo(path, title, video_id, upload_date=None, description=None):
+def write_movie_nfo(path, title, video_id, upload_date=None, description=None, duration=None):
     """Write a Kodi/Emby-compatible movie NFO file."""
     lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<movie>']
     lines.append(f'  <title>{xml_escape(title)}</title>')
     if description:
         lines.append(f'  <plot>{xml_escape(description)}</plot>')
+    if duration:
+        # Convert seconds to minutes and round
+        runtime_minutes = round(duration / 60)
+        lines.append(f'  <runtime>{runtime_minutes}</runtime>')
     if upload_date and len(str(upload_date)) >= 8:
         d = str(upload_date)[:8]
         premiered = f'{d[:4]}-{d[4:6]}-{d[6:8]}'
@@ -133,7 +137,7 @@ def write_movie_nfo(path, title, video_id, upload_date=None, description=None):
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines) + '\n')
 
-def write_episode_nfo(path, title, video_id, upload_date=None, description=None, show_title=None):
+def write_episode_nfo(path, title, video_id, upload_date=None, description=None, show_title=None, duration=None):
     """Write a Kodi/Emby-compatible episode NFO file."""
     lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<episodedetails>']
     lines.append(f'  <title>{xml_escape(title)}</title>')
@@ -141,6 +145,10 @@ def write_episode_nfo(path, title, video_id, upload_date=None, description=None,
         lines.append(f'  <showtitle>{xml_escape(show_title)}</showtitle>')
     if description:
         lines.append(f'  <plot>{xml_escape(description)}</plot>')
+    if duration:
+        # Convert seconds to minutes and round
+        runtime_minutes = round(duration / 60)
+        lines.append(f'  <runtime>{runtime_minutes}</runtime>')
     if upload_date and len(str(upload_date)) >= 8:
         d = str(upload_date)[:8]
         aired = f'{d[:4]}-{d[4:6]}-{d[6:8]}'
@@ -312,9 +320,10 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                     # Fetch full metadata if not available from flat extraction
                     upload_date = entry.get('upload_date') or ''
                     description = entry.get('description')
+                    duration = entry.get('duration')  # Duration in seconds
 
-                    if not upload_date:
-                        # Do a full extraction to get upload_date
+                    if not upload_date or not duration:
+                        # Do a full extraction to get missing metadata
                         try:
                             full_opts = {
                                 'quiet': True,
@@ -326,9 +335,12 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                                     f'https://www.youtube.com/watch?v={vid_id}',
                                     download=False
                                 )
-                                upload_date = full_info.get('upload_date') or ''
+                                if not upload_date:
+                                    upload_date = full_info.get('upload_date') or ''
                                 if not description:
                                     description = full_info.get('description')
+                                if not duration:
+                                    duration = full_info.get('duration')
                                 if not upload_date and full_info.get('timestamp'):
                                     upload_date = datetime.fromtimestamp(
                                         full_info['timestamp'], tz=timezone.utc
@@ -348,7 +360,8 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                             vid_id,
                             upload_date,
                             description,
-                            show_title=name  # Use display name as show title
+                            show_title=name,  # Use display name as show title
+                            duration=duration
                         )
                     else:  # default to movie
                         write_movie_nfo(
@@ -356,7 +369,8 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                             entry.get('title') or vid_id,
                             vid_id,
                             upload_date,
-                            description
+                            description,
+                            duration=duration
                         )
                     meta_count += 1
                     add_log(f'      + NFO metadata')
