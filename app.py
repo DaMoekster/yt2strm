@@ -322,6 +322,8 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                     description = entry.get('description')
                     duration = entry.get('duration')  # Duration in seconds
 
+                    add_log(f'      Duration from flat extract: {duration}')
+
                     if not upload_date or not duration:
                         # Do a full extraction to get missing metadata
                         try:
@@ -341,6 +343,7 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                                     description = full_info.get('description')
                                 if not duration:
                                     duration = full_info.get('duration')
+                                    add_log(f'      Duration from full extract: {duration}')
                                 if not upload_date and full_info.get('timestamp'):
                                     upload_date = datetime.fromtimestamp(
                                         full_info['timestamp'], tz=timezone.utc
@@ -353,6 +356,7 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                                 ).strftime('%Y%m%d')
 
                     # Use appropriate NFO format based on content_type
+                    add_log(f'      Writing NFO with duration: {duration} seconds ({round(duration/60) if duration else "N/A"} min)')
                     if content_type == 'tv':
                         write_episode_nfo(
                             nfo_path,
@@ -373,7 +377,7 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                             duration=duration
                         )
                     meta_count += 1
-                    add_log(f'      + NFO metadata')
+                    add_log(f'      + NFO metadata written')
                 except Exception as e:
                     add_log(f'      NFO error: {e}', 'error')
 
