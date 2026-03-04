@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 yt2strm - Lightweight YouTube-to-STRM server for Emby/Jellyfin
+FIXED: Improved audio dropout handling for longer videos
 """
 
 from flask import Flask, redirect, request, jsonify, Response, render_template_string
@@ -433,8 +434,14 @@ def bridge(video_id):
                 'ffmpeg',
                 '-hide_banner', '-loglevel', 'error',
                 '-headers', 'User-Agent: Mozilla/5.0\r\n',
+                '-reconnect', '1',
+                '-reconnect_streamed', '1',
+                '-reconnect_delay_max', '5',
                 '-i', video_url,
                 '-headers', 'User-Agent: Mozilla/5.0\r\n',
+                '-reconnect', '1',
+                '-reconnect_streamed', '1',
+                '-reconnect_delay_max', '5',
                 '-i', audio_url,
                 '-c:v', 'copy',
                 '-c:a', 'copy',
@@ -454,8 +461,10 @@ def bridge(video_id):
                         if not chunk:
                             break
                         yield chunk
-                except GeneratorExit:
+                except (GeneratorExit, BrokenPipeError):
                     pass
+                except Exception as e:
+                    add_log(f'Bridge stream error {video_id}: {e}', 'error')
                 finally:
                     try:
                         process.kill()
@@ -482,6 +491,10 @@ def bridge(video_id):
                     for chunk in r.iter_content(chunk_size=512 * 1024):
                         if chunk:
                             yield chunk
+                except (GeneratorExit, BrokenPipeError):
+                    pass
+                except Exception as e:
+                    add_log(f'Bridge fallback error {video_id}: {e}', 'error')
                 finally:
                     r.close()
 
@@ -499,21 +512,35 @@ def bridge(video_id):
 
 @app.route('/proxy/<video_id>')
 def proxy(video_id):
-    """Proxy mode — muxes best video + best audio via ffmpeg for up to 1080p."""
+    """Proxy mode — muxes best video + best audio via ffmpeg for up to 1080p.
+
+    FIXED: Added reconnection flags to handle longer videos and prevent audio dropouts.
+    """
     try:
         video_url, audio_url, height = get_proxy_urls(video_id)
         add_log(f'Proxy resolve {video_id}: {height}p, separate_audio={audio_url is not None}')
 
         if audio_url:
+            # FIX: Added reconnection flags to prevent dropouts on longer videos
             cmd = [
                 'ffmpeg',
                 '-hide_banner', '-loglevel', 'error',
+                # Video input with reconnection support
                 '-headers', 'User-Agent: Mozilla/5.0\r\n',
+                '-reconnect', '1',
+                '-reconnect_streamed', '1',
+                '-reconnect_delay_max', '5',
                 '-i', video_url,
+                # Audio input with reconnection support
                 '-headers', 'User-Agent: Mozilla/5.0\r\n',
+                '-reconnect', '1',
+                '-reconnect_streamed', '1',
+                '-reconnect_delay_max', '5',
                 '-i', audio_url,
+                # Copy codecs (no re-encoding)
                 '-c:v', 'copy',
                 '-c:a', 'copy',
+                # MP4 fragmentation for streaming
                 '-movflags', 'frag_keyframe+empty_moov',
                 '-f', 'mp4',
                 'pipe:1',
@@ -530,8 +557,12 @@ def proxy(video_id):
                         if not chunk:
                             break
                         yield chunk
-                except GeneratorExit:
+                except (GeneratorExit, BrokenPipeError):
+                    # Client disconnected - this is normal
                     pass
+                except Exception as e:
+                    # Log unexpected errors
+                    add_log(f'Proxy stream error {video_id}: {e}', 'error')
                 finally:
                     try:
                         process.kill()
@@ -553,6 +584,10 @@ def proxy(video_id):
                     for chunk in r.iter_content(chunk_size=256 * 1024):
                         if chunk:
                             yield chunk
+                except (GeneratorExit, BrokenPipeError):
+                    pass
+                except Exception as e:
+                    add_log(f'Proxy fallback error {video_id}: {e}', 'error')
                 finally:
                     r.close()
 
@@ -831,8 +866,8 @@ HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 
-<h1><span>yt2strm</span></h1>
-<div class="subtitle">YouTube → STRM for Emby / Jellyfin</div>
+<h1><span>yt2strm</span> <small style="color:var(--accent2);font-size:.7rem">[FIXED]</small></h1>
+<div class="subtitle">YouTube → STRM for Emby / Jellyfin (Audio dropout fix applied)</div>
 
 <!-- Add Channel -->
 <div class="card">
@@ -1078,7 +1113,7 @@ if __name__ == '__main__':
     os.makedirs(MEDIA_DIR, exist_ok=True)
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    add_log(f'yt2strm starting — {EXTERNAL_URL} — mode={MODE}')
+    add_log(f'yt2strm starting — {EXTERNAL_URL} — mode={MODE} [FIXED VERSION]')
     add_log(f'Metadata: {"enabled (NFO + thumbnails)" if METADATA else "disabled"}')
 
     if MODE == 'proxy':
