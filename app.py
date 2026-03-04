@@ -21,6 +21,8 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger('yt2strm')
 
+VERSION = '1.1.0'  # Version number
+
 # ── Config from environment ──────────────────────────────────────
 HOST         = os.environ.get('YT2STRM_HOST', '0.0.0.0')
 PORT         = int(os.environ.get('YT2STRM_PORT', 5000))
@@ -117,16 +119,12 @@ def download_image(url, dest_path):
         pass
     return False
 
-def write_movie_nfo(path, title, video_id, upload_date=None, description=None, duration=None):
+def write_movie_nfo(path, title, video_id, upload_date=None, description=None):
     """Write a Kodi/Emby-compatible movie NFO file."""
     lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<movie>']
     lines.append(f'  <title>{xml_escape(title)}</title>')
     if description:
         lines.append(f'  <plot>{xml_escape(description)}</plot>')
-    if duration:
-        # Convert seconds to minutes and round
-        runtime_minutes = round(duration / 60)
-        lines.append(f'  <runtime>{runtime_minutes}</runtime>')
     if upload_date and len(str(upload_date)) >= 8:
         d = str(upload_date)[:8]
         premiered = f'{d[:4]}-{d[4:6]}-{d[6:8]}'
@@ -137,7 +135,7 @@ def write_movie_nfo(path, title, video_id, upload_date=None, description=None, d
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines) + '\n')
 
-def write_episode_nfo(path, title, video_id, upload_date=None, description=None, show_title=None, duration=None):
+def write_episode_nfo(path, title, video_id, upload_date=None, description=None, show_title=None):
     """Write a Kodi/Emby-compatible episode NFO file."""
     lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<episodedetails>']
     lines.append(f'  <title>{xml_escape(title)}</title>')
@@ -145,10 +143,6 @@ def write_episode_nfo(path, title, video_id, upload_date=None, description=None,
         lines.append(f'  <showtitle>{xml_escape(show_title)}</showtitle>')
     if description:
         lines.append(f'  <plot>{xml_escape(description)}</plot>')
-    if duration:
-        # Convert seconds to minutes and round
-        runtime_minutes = round(duration / 60)
-        lines.append(f'  <runtime>{runtime_minutes}</runtime>')
     if upload_date and len(str(upload_date)) >= 8:
         d = str(upload_date)[:8]
         aired = f'{d[:4]}-{d[4:6]}-{d[6:8]}'
@@ -320,12 +314,9 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                     # Fetch full metadata if not available from flat extraction
                     upload_date = entry.get('upload_date') or ''
                     description = entry.get('description')
-                    duration = entry.get('duration')  # Duration in seconds
 
-                    add_log(f'      Duration from flat extract: {duration}')
-
-                    if not upload_date or not duration:
-                        # Do a full extraction to get missing metadata
+                    if not upload_date:
+                        # Do a full extraction to get upload_date
                         try:
                             full_opts = {
                                 'quiet': True,
@@ -337,13 +328,9 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                                     f'https://www.youtube.com/watch?v={vid_id}',
                                     download=False
                                 )
-                                if not upload_date:
-                                    upload_date = full_info.get('upload_date') or ''
+                                upload_date = full_info.get('upload_date') or ''
                                 if not description:
                                     description = full_info.get('description')
-                                if not duration:
-                                    duration = full_info.get('duration')
-                                    add_log(f'      Duration from full extract: {duration}')
                                 if not upload_date and full_info.get('timestamp'):
                                     upload_date = datetime.fromtimestamp(
                                         full_info['timestamp'], tz=timezone.utc
@@ -356,7 +343,6 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                                 ).strftime('%Y%m%d')
 
                     # Use appropriate NFO format based on content_type
-                    add_log(f'      Writing NFO with duration: {duration} seconds ({round(duration/60) if duration else "N/A"} min)')
                     if content_type == 'tv':
                         write_episode_nfo(
                             nfo_path,
@@ -364,8 +350,7 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                             vid_id,
                             upload_date,
                             description,
-                            show_title=name,  # Use display name as show title
-                            duration=duration
+                            show_title=name  # Use display name as show title
                         )
                     else:  # default to movie
                         write_movie_nfo(
@@ -373,11 +358,10 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                             entry.get('title') or vid_id,
                             vid_id,
                             upload_date,
-                            description,
-                            duration=duration
+                            description
                         )
                     meta_count += 1
-                    add_log(f'      + NFO metadata written')
+                    add_log(f'      + NFO metadata')
                 except Exception as e:
                     add_log(f'      NFO error: {e}', 'error')
 
@@ -685,6 +669,41 @@ def api_scan():
     threading.Thread(target=run_full_scan, daemon=True).start()
     return jsonify({'status': 'started'})
 
+@app.route('/api/scan/<int:idx>', methods=['POST'])
+def api_scan_single(idx):
+    """Scan a single channel by index."""
+    if state['scanning']:
+        return jsonify({'error': 'Scan already running'}), 409
+
+    channels = load_channels()
+    if not (0 <= idx < len(channels)):
+        return jsonify({'error': 'Invalid index'}), 400
+
+    def scan_single_channel():
+        state['scanning'] = True
+        state['results'] = []
+        ch = channels[idx]
+        label = ch.get('name') or ch['url']
+        folder = ch.get('folder')
+        content_type = ch.get('content_type', 'movie')
+        if folder:
+            label = f'{folder}/{label}'
+        add_log(f'Scanning single channel: {label}')
+        try:
+            count, resolved = scan_channel(ch['url'], ch.get('name'), folder, content_type)
+            display = f'{folder}/{resolved}' if folder else resolved
+            state['results'].append({'channel': display, 'new': count, 'status': 'ok'})
+            add_log(f'✓ {display} complete')
+        except Exception as e:
+            state['results'].append({'channel': label, 'error': str(e), 'status': 'error'})
+            add_log(f'✗ Error: {e}', 'error')
+        state['scanning'] = False
+        state['last_scan'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        add_log('Scan complete')
+
+    threading.Thread(target=scan_single_channel, daemon=True).start()
+    return jsonify({'status': 'started'})
+
 @app.route('/api/regenerate', methods=['POST'])
 def api_regenerate():
     """Rewrite every .strm file so it points at the current mode endpoint."""
@@ -812,6 +831,7 @@ def index():
         'video_limit': VIDEO_LIMIT,
         'metadata': METADATA,
         'play_height': PLAY_HEIGHT,
+        'version': VERSION,
     })
 
 HTML = r"""<!DOCTYPE html>
@@ -890,8 +910,8 @@ HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 
-<h1><span>yt2strm</span> <small style="color:var(--accent2);font-size:.7rem">[FIXED]</small></h1>
-<div class="subtitle">YouTube → STRM for Emby / Jellyfin (Audio dropout fix applied)</div>
+<h1><span>yt2strm</span> <small style="color:var(--muted);font-size:.7rem">v{{ conf.version }}</small></h1>
+<div class="subtitle">YouTube → STRM for Emby / Jellyfin</div>
 
 <!-- Add Channel -->
 <div class="card">
@@ -1009,6 +1029,7 @@ async function loadChannels(){
         <span class="ch-url">${esc(c.url)}</span>
       </div>
       <div class="ch-actions">
+        <button class="btn-scan btn-sm" onclick="scanChannel(${i})">▶</button>
         <button class="btn-primary btn-sm" onclick="openEdit(${i})">✎</button>
         <button class="btn-danger" onclick="delChannel(${i})">✕</button>
       </div>
@@ -1029,6 +1050,11 @@ async function addChannel(){
   document.getElementById('chFolder').value='';
   document.getElementById('chContentType').value='movie';
   loadChannels();
+}
+
+async function scanChannel(idx){
+  await fetchJSON('/api/scan/'+idx,{method:'POST'});
+  pollStatus();
 }
 
 async function delChannel(idx){
