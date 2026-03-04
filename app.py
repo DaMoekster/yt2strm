@@ -21,7 +21,7 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger('yt2strm')
 
-VERSION = '0.3.0'  # Version number
+VERSION = '0.4.0'  # Version number
 
 # ── Config from environment ──────────────────────────────────────
 HOST         = os.environ.get('YT2STRM_HOST', '0.0.0.0')
@@ -142,10 +142,20 @@ def write_movie_nfo(path, title, video_id, upload_date=None, description=None, d
     """Write a Kodi/Emby-compatible movie NFO file."""
     lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<movie>']
     lines.append(f'  <title>{xml_escape(title)}</title>')
+
+    # Build tagline with year and duration
+    tagline_parts = []
+    if upload_date and len(str(upload_date)) >= 8:
+        year = str(upload_date)[:4]
+        tagline_parts.append(year)
     if duration:
-        tagline = format_duration(duration)
-        if tagline:
-            lines.append(f'  <tagline>{xml_escape(tagline)}</tagline>')
+        duration_str = format_duration(duration)
+        if duration_str:
+            tagline_parts.append(duration_str)
+    if tagline_parts:
+        tagline = " - ".join(tagline_parts)
+        lines.append(f'  <tagline>{xml_escape(tagline)}</tagline>')
+
     if description:
         lines.append(f'  <plot>{xml_escape(description)}</plot>')
     if upload_date and len(str(upload_date)) >= 8:
@@ -164,10 +174,20 @@ def write_episode_nfo(path, title, video_id, upload_date=None, description=None,
     lines.append(f'  <title>{xml_escape(title)}</title>')
     if show_title:
         lines.append(f'  <showtitle>{xml_escape(show_title)}</showtitle>')
+
+    # Build tagline with year and duration
+    tagline_parts = []
+    if upload_date and len(str(upload_date)) >= 8:
+        year = str(upload_date)[:4]
+        tagline_parts.append(year)
     if duration:
-        tagline = format_duration(duration)
-        if tagline:
-            lines.append(f'  <tagline>{xml_escape(tagline)}</tagline>')
+        duration_str = format_duration(duration)
+        if duration_str:
+            tagline_parts.append(duration_str)
+    if tagline_parts:
+        tagline = " - ".join(tagline_parts)
+        lines.append(f'  <tagline>{xml_escape(tagline)}</tagline>')
+
     if description:
         lines.append(f'  <plot>{xml_escape(description)}</plot>')
     if upload_date and len(str(upload_date)) >= 8:
