@@ -21,7 +21,7 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger('yt2strm')
 
-VERSION = '0.1.0'  # Version number
+VERSION = '0.2.0'  # Version number
 
 # ── Config from environment ──────────────────────────────────────
 HOST         = os.environ.get('YT2STRM_HOST', '0.0.0.0')
@@ -29,7 +29,7 @@ PORT         = int(os.environ.get('YT2STRM_PORT', 5000))
 EXTERNAL_URL = os.environ.get('YT2STRM_URL', '').rstrip('/')
 MEDIA_DIR    = os.environ.get('YT2STRM_MEDIA', '/media/YouTube')
 DATA_DIR     = os.environ.get('YT2STRM_DATA', '/data')
-SCAN_INTERVAL= int(os.environ.get('YT2STRM_INTERVAL', 3600))   # seconds between scans, 0=off
+SCAN_INTERVAL= int(os.environ.get('YT2STRM_INTERVAL', 1)) * 3600   # hours between scans, 0=off
 VIDEO_LIMIT  = int(os.environ.get('YT2STRM_LIMIT', 50))
 MODE         = os.environ.get('YT2STRM_MODE', 'redirect')       # redirect, bridge, or proxy
 METADATA     = os.environ.get('YT2STRM_METADATA', 'true').lower() in ('true', '1', 'yes')
@@ -827,7 +827,7 @@ def index():
         'external_url': EXTERNAL_URL,
         'mode': MODE,
         'media_dir': MEDIA_DIR,
-        'scan_interval': SCAN_INTERVAL,
+        'scan_interval': SCAN_INTERVAL // 3600 if SCAN_INTERVAL > 0 else 0,  # Convert to hours
         'video_limit': VIDEO_LIMIT,
         'metadata': METADATA,
         'play_height': PLAY_HEIGHT,
@@ -973,7 +973,7 @@ HTML = r"""<!DOCTYPE html>
     <dt>External URL</dt><dd>{{ conf.external_url }}</dd>
     <dt>Mode</dt><dd>{{ conf.mode }}</dd>
     <dt>Media folder</dt><dd>{{ conf.media_dir }}</dd>
-    <dt>Scan interval</dt><dd>{{ conf.scan_interval }}s</dd>
+    <dt>Scan interval</dt><dd>{{ conf.scan_interval }}h</dd>
     <dt>Video limit</dt><dd>{{ conf.video_limit }} per channel</dd>
     <dt>Metadata</dt><dd><span class="conf-badge {{ 'conf-on' if conf.metadata else 'conf-off' }}">{{ 'NFO + thumbnails' if conf.metadata else 'disabled' }}</span></dd>
     <dt>Play height</dt><dd>{{ conf.play_height if conf.play_height > 0 else 'auto' }}{{ 'p' if conf.play_height > 0 else '' }}</dd>
@@ -1178,6 +1178,6 @@ if __name__ == '__main__':
 
     if SCAN_INTERVAL > 0:
         threading.Thread(target=background_scanner, daemon=True).start()
-        add_log(f'Background scanner enabled every {SCAN_INTERVAL}s')
+        add_log(f'Background scanner enabled every {SCAN_INTERVAL // 3600}h')
 
     app.run(host=HOST, port=PORT, debug=False, threaded=True)
