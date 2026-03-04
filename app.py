@@ -21,7 +21,7 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger('yt2strm')
 
-VERSION = '0.2.0'  # Version number
+VERSION = '1.1.0'  # Version number
 
 # ── Config from environment ──────────────────────────────────────
 HOST         = os.environ.get('YT2STRM_HOST', '0.0.0.0')
@@ -119,10 +119,33 @@ def download_image(url, dest_path):
         pass
     return False
 
-def write_movie_nfo(path, title, video_id, upload_date=None, description=None):
+def format_duration(seconds):
+    """Convert seconds to human-readable duration format."""
+    if not seconds:
+        return None
+
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+
+    parts = []
+    if hours > 0:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes > 0:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    if secs > 0 or not parts:  # Always show seconds if no hours/minutes
+        parts.append(f"{secs} second{'s' if secs != 1 else ''}")
+
+    return ", ".join(parts)
+
+def write_movie_nfo(path, title, video_id, upload_date=None, description=None, duration=None):
     """Write a Kodi/Emby-compatible movie NFO file."""
     lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<movie>']
     lines.append(f'  <title>{xml_escape(title)}</title>')
+    if duration:
+        tagline = format_duration(duration)
+        if tagline:
+            lines.append(f'  <tagline>{xml_escape(tagline)}</tagline>')
     if description:
         lines.append(f'  <plot>{xml_escape(description)}</plot>')
     if upload_date and len(str(upload_date)) >= 8:
@@ -135,12 +158,16 @@ def write_movie_nfo(path, title, video_id, upload_date=None, description=None):
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines) + '\n')
 
-def write_episode_nfo(path, title, video_id, upload_date=None, description=None, show_title=None):
+def write_episode_nfo(path, title, video_id, upload_date=None, description=None, show_title=None, duration=None):
     """Write a Kodi/Emby-compatible episode NFO file."""
     lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<episodedetails>']
     lines.append(f'  <title>{xml_escape(title)}</title>')
     if show_title:
         lines.append(f'  <showtitle>{xml_escape(show_title)}</showtitle>')
+    if duration:
+        tagline = format_duration(duration)
+        if tagline:
+            lines.append(f'  <tagline>{xml_escape(tagline)}</tagline>')
     if description:
         lines.append(f'  <plot>{xml_escape(description)}</plot>')
     if upload_date and len(str(upload_date)) >= 8:
@@ -314,9 +341,10 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                     # Fetch full metadata if not available from flat extraction
                     upload_date = entry.get('upload_date') or ''
                     description = entry.get('description')
+                    duration = entry.get('duration')  # Duration in seconds
 
-                    if not upload_date:
-                        # Do a full extraction to get upload_date
+                    if not upload_date or not duration:
+                        # Do a full extraction to get missing metadata
                         try:
                             full_opts = {
                                 'quiet': True,
@@ -328,9 +356,12 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                                     f'https://www.youtube.com/watch?v={vid_id}',
                                     download=False
                                 )
-                                upload_date = full_info.get('upload_date') or ''
+                                if not upload_date:
+                                    upload_date = full_info.get('upload_date') or ''
                                 if not description:
                                     description = full_info.get('description')
+                                if not duration:
+                                    duration = full_info.get('duration')
                                 if not upload_date and full_info.get('timestamp'):
                                     upload_date = datetime.fromtimestamp(
                                         full_info['timestamp'], tz=timezone.utc
@@ -350,7 +381,8 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                             vid_id,
                             upload_date,
                             description,
-                            show_title=name  # Use display name as show title
+                            show_title=name,  # Use display name as show title
+                            duration=duration
                         )
                     else:  # default to movie
                         write_movie_nfo(
@@ -358,7 +390,8 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                             entry.get('title') or vid_id,
                             vid_id,
                             upload_date,
-                            description
+                            description,
+                            duration=duration
                         )
                     meta_count += 1
                     add_log(f'      + NFO metadata')
