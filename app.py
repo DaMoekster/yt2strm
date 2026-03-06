@@ -2,6 +2,7 @@
 """
 yt2strm - Lightweight YouTube-to-STRM server for Emby/Jellyfin
 FIXED: Improved audio dropout handling for longer videos
+FIXED: Added cookie support for YouTube bot detection
 """
 
 from flask import Flask, redirect, request, jsonify, Response, render_template_string
@@ -21,7 +22,7 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger('yt2strm')
 
-VERSION = '0.4.0'  # Version number
+VERSION = '0.5.0'  # Version number
 
 # ── Config from environment ──────────────────────────────────────
 HOST         = os.environ.get('YT2STRM_HOST', '0.0.0.0')
@@ -34,6 +35,7 @@ VIDEO_LIMIT  = int(os.environ.get('YT2STRM_LIMIT', 50))
 MODE         = os.environ.get('YT2STRM_MODE', 'redirect')       # redirect, bridge, or proxy
 METADATA     = os.environ.get('YT2STRM_METADATA', 'true').lower() in ('true', '1', 'yes')
 PLAY_HEIGHT  = int(os.environ.get('YT2STRM_PLAY_HEIGHT', 0))    # max height for play/bridge mode, 0=auto
+COOKIES_FILE = os.environ.get('YT2STRM_COOKIES', '').strip()     # path to cookies.txt file
 
 if not EXTERNAL_URL:
     EXTERNAL_URL = f'http://localhost:{PORT}'
@@ -53,6 +55,17 @@ def add_log(msg, level='info'):
     state['logs'].append({'time': ts, 'msg': msg, 'level': level})
     state['logs'] = state['logs'][-500:]  # Keep more logs for detailed scanning
     getattr(logger, level, logger.info)(msg)
+
+def get_ytdlp_base_opts():
+    """Return base yt-dlp options including cookies if configured."""
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'socket_timeout': 30,
+    }
+    if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
+        opts['cookiefile'] = COOKIES_FILE
+    return opts
 
 # ── Channel persistence ─────────────────────────────────────────
 def load_channels():
@@ -222,12 +235,9 @@ def get_video_url(video_id):
         # Auto mode: try to get best available (usually caps at 360p or 720p for muxed streams)
         format_str = 'best[ext=mp4][height<=1080]/best[ext=mp4]/best'
 
-    opts = {
-        'format': format_str,
-        'quiet': True,
-        'no_warnings': True,
-        'socket_timeout': 30,
-    }
+    opts = get_ytdlp_base_opts()
+    opts['format'] = format_str
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(
             f'https://www.youtube.com/watch?v={video_id}',
@@ -241,18 +251,15 @@ def get_proxy_urls(video_id):
     Excludes AV1 codec for compatibility with older devices like Nvidia Shield.
     Prefers H.264 (avc1) which is universally supported.
     """
-    opts = {
-        'format': (
-            # Prefer H.264 up to configured height, exclude AV1
-            'bestvideo[height<=1080][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/'
-            'bestvideo[height<=1080][ext=mp4][vcodec!=av01][vcodec!=vp9]+bestaudio[ext=m4a]/'
-            'bestvideo[height<=1080][ext=mp4][vcodec!=av01]+bestaudio/'
-            'best[ext=mp4]/best'
-        ),
-        'quiet': True,
-        'no_warnings': True,
-        'socket_timeout': 30,
-    }
+    opts = get_ytdlp_base_opts()
+    opts['format'] = (
+        # Prefer H.264 up to configured height, exclude AV1
+        'bestvideo[height<=1080][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/'
+        'bestvideo[height<=1080][ext=mp4][vcodec!=av01][vcodec!=vp9]+bestaudio[ext=m4a]/'
+        'bestvideo[height<=1080][ext=mp4][vcodec!=av01]+bestaudio/'
+        'best[ext=mp4]/best'
+    )
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(
             f'https://www.youtube.com/watch?v={video_id}',
@@ -273,13 +280,10 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
         folder: Optional folder to organize channels
         content_type: 'movie' or 'tv' - determines NFO format
     """
-    opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': 'in_playlist',
-        'playlistend': VIDEO_LIMIT,
-        'socket_timeout': 30,
-    }
+    opts = get_ytdlp_base_opts()
+    opts['extract_flat'] = 'in_playlist'
+    opts['playlistend'] = VIDEO_LIMIT
+
     if '/@' in channel_url and '/videos' not in channel_url and '/playlist' not in channel_url:
         channel_url = channel_url.rstrip('/') + '/videos'
 
@@ -366,11 +370,7 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                     if not upload_date or not duration:
                         # Do a full extraction to get missing metadata
                         try:
-                            full_opts = {
-                                'quiet': True,
-                                'no_warnings': True,
-                                'socket_timeout': 30,
-                            }
+                            full_opts = get_ytdlp_base_opts()
                             with yt_dlp.YoutubeDL(full_opts) as ydl_full:
                                 full_info = ydl_full.extract_info(
                                     f'https://www.youtube.com/watch?v={vid_id}',
@@ -437,7 +437,8 @@ def run_full_scan():
     state['results'] = []
     channels = load_channels()
     add_log(f'Scan started — {len(channels)} channel(s)' +
-            (' [metadata enabled]' if METADATA else ''))
+            (' [metadata enabled]' if METADATA else '') +
+            (' [cookies loaded]' if COOKIES_FILE and os.path.isfile(COOKIES_FILE) else ' [no cookies]'))
 
     for i, ch in enumerate(channels):
         label = ch.get('name') or ch['url']
@@ -794,7 +795,8 @@ def api_regenerate():
 @app.route('/api/debug/<video_id>', methods=['GET'])
 def api_debug(video_id):
     """Show what yt-dlp resolves for a video in each mode."""
-    result = {'video_id': video_id, 'current_mode': MODE, 'play_height_config': PLAY_HEIGHT}
+    result = {'video_id': video_id, 'current_mode': MODE, 'play_height_config': PLAY_HEIGHT,
+              'cookies_loaded': bool(COOKIES_FILE and os.path.isfile(COOKIES_FILE))}
 
     try:
         # Use the same format logic as get_video_url()
@@ -803,10 +805,9 @@ def api_debug(video_id):
         else:
             format_str = 'best[ext=mp4][height<=1080]/best[ext=mp4]/best'
 
-        opts = {
-            'format': format_str,
-            'quiet': True, 'no_warnings': True, 'socket_timeout': 30,
-        }
+        opts = get_ytdlp_base_opts()
+        opts['format'] = format_str
+
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(
                 f'https://www.youtube.com/watch?v={video_id}', download=False)
@@ -822,15 +823,14 @@ def api_debug(video_id):
         result['play_mode'] = {'error': str(e)}
 
     try:
-        opts = {
-            'format': (
-                'bestvideo[height<=1080][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/'
-                'bestvideo[height<=1080][ext=mp4][vcodec!=av01][vcodec!=vp9]+bestaudio[ext=m4a]/'
-                'bestvideo[height<=1080][ext=mp4][vcodec!=av01]+bestaudio/'
-                'best[ext=mp4]/best'
-            ),
-            'quiet': True, 'no_warnings': True, 'socket_timeout': 30,
-        }
+        opts = get_ytdlp_base_opts()
+        opts['format'] = (
+            'bestvideo[height<=1080][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/'
+            'bestvideo[height<=1080][ext=mp4][vcodec!=av01][vcodec!=vp9]+bestaudio[ext=m4a]/'
+            'bestvideo[height<=1080][ext=mp4][vcodec!=av01]+bestaudio/'
+            'best[ext=mp4]/best'
+        )
+
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(
                 f'https://www.youtube.com/watch?v={video_id}', download=False)
@@ -885,6 +885,8 @@ def index():
         'metadata': METADATA,
         'play_height': PLAY_HEIGHT,
         'version': VERSION,
+        'cookies': bool(COOKIES_FILE and os.path.isfile(COOKIES_FILE)),
+        'cookies_path': COOKIES_FILE or '(not set)',
     })
 
 HTML = r"""<!DOCTYPE html>
@@ -1030,6 +1032,7 @@ HTML = r"""<!DOCTYPE html>
     <dt>Video limit</dt><dd>{{ conf.video_limit }} per channel</dd>
     <dt>Metadata</dt><dd><span class="conf-badge {{ 'conf-on' if conf.metadata else 'conf-off' }}">{{ 'NFO + thumbnails' if conf.metadata else 'disabled' }}</span></dd>
     <dt>Play height</dt><dd>{{ conf.play_height if conf.play_height > 0 else 'auto' }}{{ 'p' if conf.play_height > 0 else '' }}</dd>
+    <dt>Cookies</dt><dd><span class="conf-badge {{ 'conf-on' if conf.cookies else 'conf-off' }}">{{ 'loaded ✓' if conf.cookies else 'not loaded' }}</span> <span style="font-size:.75rem;color:var(--muted)">{{ conf.cookies_path }}</span></dd>
   </dl>
 </div>
 
@@ -1216,18 +1219,27 @@ if __name__ == '__main__':
     os.makedirs(MEDIA_DIR, exist_ok=True)
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    add_log(f'yt2strm starting — {EXTERNAL_URL} — mode={MODE} [FIXED VERSION]')
+    add_log(f'yt2strm starting — {EXTERNAL_URL} — mode={MODE}')
     add_log(f'Metadata: {"enabled (NFO + thumbnails)" if METADATA else "disabled"}')
 
-    if MODE == 'proxy':
+    # Cookie status
+    if COOKIES_FILE:
+        if os.path.isfile(COOKIES_FILE):
+            add_log(f'Cookies loaded from {COOKIES_FILE} ✓')
+        else:
+            add_log(f'Cookies file not found: {COOKIES_FILE} — YouTube may block requests!', 'error')
+    else:
+        add_log('No cookies configured (YT2STRM_COOKIES) — YouTube may block requests', 'error')
+
+    if MODE in ('proxy', 'bridge'):
         try:
             r = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, timeout=5)
             if r.returncode == 0:
                 add_log(f'ffmpeg found: {r.stdout.split(chr(10))[0]}')
             else:
-                add_log('ffmpeg not working — proxy mode will fail!', 'error')
+                add_log('ffmpeg not working — proxy/bridge mode will fail!', 'error')
         except FileNotFoundError:
-            add_log('ffmpeg not found — proxy mode requires ffmpeg!', 'error')
+            add_log('ffmpeg not found — proxy/bridge mode requires ffmpeg!', 'error')
 
     if SCAN_INTERVAL > 0:
         threading.Thread(target=background_scanner, daemon=True).start()

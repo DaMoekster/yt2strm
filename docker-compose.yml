@@ -10,9 +10,11 @@ services:
       - YT2STRM_LIMIT=20000  #max number of movies
       - YT2STRM_MODE=bridge  # Use bridge mode for high-quality with ffmpeg muxing
       - YT2STRM_PLAY_HEIGHT=720  # Force 720p in play/bridge mode (0=auto, 360/480/720/1080)
+      - YT2STRM_COOKIES=/data/cookies.txt  # ← NEW: path inside container
     volumes:
       - yt2strm-data:/data
       - E:/YOUTUBEstrms:/media
+      - ./cookies.txt:/data/cookies.txt:ro  # ← NEW: mount cookies file
     ports:
       - 5000:5000
     restart: unless-stopped
