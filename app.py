@@ -252,6 +252,10 @@ def scan_channel(channel_url, custom_name=None, folder=None):
 
                     try:
                         full_opts = get_ytdlp_base_opts()
+                        # Skip format selection - we only need metadata
+                        full_opts['format'] = 'best'
+                        full_opts['skip_download'] = True
+                        
                         with yt_dlp.YoutubeDL(full_opts) as ydl_full:
                             full_info = ydl_full.extract_info(
                                 f'https://www.youtube.com/watch?v={vid_id}',
