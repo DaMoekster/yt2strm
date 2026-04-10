@@ -54,11 +54,7 @@ services:
       - YT2STRM_METADATA=true            # Enable NFO + thumbnails
       - YT2STRM_COOKIES=/cookies.txt     # Path to cookies file
     restart: unless-stopped
+```
 
-### Manual Install
 
-# Install dependencies
-pip install -r requirements.txt
 
-# Run the app
-python app.py
