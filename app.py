@@ -20,17 +20,17 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger('yt2strm')
 
-VERSION = '1.0.0'  # Simplified version
+VERSION = '1.0.1'  # Date handling + NFO compatibility fixes
 
 # ── Config from environment ──────────────────────────────────────
-HOST         = os.environ.get('YT2STRM_HOST', '0.0.0.0')
-PORT         = int(os.environ.get('YT2STRM_PORT', 5000))
-MEDIA_DIR    = os.environ.get('YT2STRM_MEDIA', '/media/YouTube')
-DATA_DIR     = os.environ.get('YT2STRM_DATA', '/data')
-SCAN_INTERVAL= int(os.environ.get('YT2STRM_INTERVAL', 1)) * 3600   # hours between scans, 0=off
-VIDEO_LIMIT  = int(os.environ.get('YT2STRM_LIMIT', 50))
-METADATA     = os.environ.get('YT2STRM_METADATA', 'true').lower() in ('true', '1', 'yes')
-COOKIES_FILE = os.environ.get('YT2STRM_COOKIES', '').strip()     # path to cookies.txt file
+HOST          = os.environ.get('YT2STRM_HOST', '0.0.0.0')
+PORT          = int(os.environ.get('YT2STRM_PORT', 5000))
+MEDIA_DIR     = os.environ.get('YT2STRM_MEDIA', '/media/YouTube')
+DATA_DIR      = os.environ.get('YT2STRM_DATA', '/data')
+SCAN_INTERVAL = int(os.environ.get('YT2STRM_INTERVAL', 1)) * 3600   # hours between scans, 0=off
+VIDEO_LIMIT   = int(os.environ.get('YT2STRM_LIMIT', 50))
+METADATA      = os.environ.get('YT2STRM_METADATA', 'true').lower() in ('true', '1', 'yes')
+COOKIES_FILE  = os.environ.get('YT2STRM_COOKIES', '').strip()     # path to cookies.txt file
 
 CHANNELS_FILE = os.path.join(DATA_DIR, 'channels.json')
 
@@ -63,7 +63,7 @@ def get_ytdlp_base_opts():
 def load_channels():
     try:
         if os.path.exists(CHANNELS_FILE):
-            with open(CHANNELS_FILE, 'r') as f:
+            with open(CHANNELS_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
     except Exception as e:
         add_log(f'Error loading channels: {e}', 'error')
@@ -71,7 +71,7 @@ def load_channels():
 
 def save_channels(channels):
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(CHANNELS_FILE, 'w') as f:
+    with open(CHANNELS_FILE, 'w', encoding='utf-8') as f:
         json.dump(channels, f, indent=2)
 
 # ── Helpers ──────────────────────────────────────────────────────
@@ -83,6 +83,84 @@ def sanitize(name):
 def xml_escape(text):
     """Escape text for safe inclusion in XML content."""
     return html_escape(str(text), quote=False)
+
+def normalize_yt_date(date_value=None, timestamp_value=None):
+    """
+    Normalize different date representations into YYYYMMDD.
+    Supports:
+    - 'YYYYMMDD'
+    - 'YYYY-MM-DD'
+    - 'YYYY/MM/DD'
+    - ISO timestamps (e.g., 2024-05-09T12:34:56Z)
+    - unix timestamps (seconds)
+    """
+    if date_value is not None:
+        s = str(date_value).strip()
+        if s:
+            # Exact YYYYMMDD
+            if re.fullmatch(r'\d{8}', s):
+                return s
+
+            # Common date formats
+            for fmt in ('%Y-%m-%d', '%Y/%m/%d', '%Y.%m.%d'):
+                try:
+                    return datetime.strptime(s, fmt).strftime('%Y%m%d')
+                except Exception:
+                    pass
+
+            # ISO-like format: take first 10 chars if date prefix exists
+            m = re.match(r'^(\d{4})-(\d{2})-(\d{2})', s)
+            if m:
+                return f'{m.group(1)}{m.group(2)}{m.group(3)}'
+
+    # Fallback to timestamp
+    if timestamp_value is not None:
+        try:
+            ts = int(timestamp_value)
+            return datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y%m%d')
+        except Exception:
+            pass
+
+    return ''
+
+def yyyymmdd_to_iso(d):
+    """Convert YYYYMMDD -> YYYY-MM-DD, else empty string."""
+    if d and re.fullmatch(r'\d{8}', str(d)):
+        s = str(d)
+        return f'{s[:4]}-{s[4:6]}-{s[6:8]}'
+    return ''
+
+def nfo_needs_update(nfo_path):
+    """
+    Returns True if NFO should be rewritten to include/normalize release tags.
+    Rewrites if:
+    - file does not exist
+    - missing <releasedate> or <premiered>
+    - legacy DD/MM/YYYY releasedate format is present
+    """
+    if not os.path.exists(nfo_path):
+        return True
+
+    try:
+        with open(nfo_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        lower = content.lower()
+        has_releasedate = '<releasedate>' in lower
+        has_premiered = '<premiered>' in lower
+
+        legacy_ddmmyyyy = re.search(
+            r'<releasedate>\s*\d{2}/\d{2}/\d{4}\s*</releasedate>',
+            content,
+            flags=re.IGNORECASE
+        ) is not None
+
+        if (not has_releasedate) or (not has_premiered) or legacy_ddmmyyyy:
+            return True
+        return False
+    except Exception:
+        # If unreadable, try to rewrite it
+        return True
 
 def download_thumbnail(video_id, dest_path):
     """Download the best available YouTube thumbnail for a video."""
@@ -137,15 +215,16 @@ def format_duration(seconds):
 
 def write_movie_nfo(path, title, video_id, upload_date=None, description=None, duration=None):
     """Write a Kodi/Emby-compatible movie NFO file."""
+    d_norm = normalize_yt_date(upload_date)
+    iso_date = yyyymmdd_to_iso(d_norm)
+
     lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<movie>']
     lines.append(f'  <title>{xml_escape(title)}</title>')
 
     # Build tagline: "YYYY-MM-DD, Xmin Ysec" or just "Xmin Ysec" if no date
     tagline_parts = []
-    if upload_date and len(str(upload_date)) >= 8:
-        d = str(upload_date)[:8]
-        formatted_date = f'{d[:4]}-{d[4:6]}-{d[6:8]}'
-        tagline_parts.append(formatted_date)
+    if iso_date:
+        tagline_parts.append(iso_date)
     if duration:
         duration_str = format_duration(duration)
         if duration_str:
@@ -157,15 +236,15 @@ def write_movie_nfo(path, title, video_id, upload_date=None, description=None, d
     if description:
         lines.append(f'  <plot>{xml_escape(description)}</plot>')
 
-    # Add releasedate tag in DD/MM/YYYY format if upload_date is available
-    if upload_date and len(str(upload_date)) >= 8:
-        d = str(upload_date)[:8]
-        release_date = f'{d[6:8]}/{d[4:6]}/{d[:4]}'
-        lines.append(f'  <releasedate>{release_date}</releasedate>')
-        lines.append(f'  <year>{d[:4]}</year>')
+    # Use ISO date fields for broad compatibility
+    if iso_date:
+        lines.append(f'  <releasedate>{iso_date}</releasedate>')
+        lines.append(f'  <premiered>{iso_date}</premiered>')
+        lines.append(f'  <year>{iso_date[:4]}</year>')
 
     lines.append(f'  <uniqueid type="youtube">{xml_escape(video_id)}</uniqueid>')
     lines.append('</movie>')
+
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines) + '\n')
 
@@ -221,7 +300,8 @@ def scan_channel(channel_url, custom_name=None, folder=None):
     for idx, entry in enumerate(entries, 1):
         if not entry:
             continue
-        vid_id    = entry.get('id') or entry.get('url') or ''
+
+        vid_id = entry.get('id') or entry.get('url') or ''
         vid_title = sanitize(entry.get('title') or vid_id)
         if not vid_id or not vid_title:
             continue
@@ -242,23 +322,28 @@ def scan_channel(channel_url, custom_name=None, folder=None):
         # ── Metadata (NFO + thumbnail) ───────────────────────────
         if METADATA:
             nfo_path = os.path.join(channel_dir, f'{vid_title}.nfo')
-            if not os.path.exists(nfo_path):
-                try:
-                    # Get basic metadata from flat extraction
-                    upload_date = entry.get('upload_date') or ''
+
+            try:
+                should_write_nfo = nfo_needs_update(nfo_path)
+                if should_write_nfo:
+                    # Date from flat extraction (with fallbacks)
+                    raw_date = (
+                        entry.get('upload_date')
+                        or entry.get('release_date')
+                        or entry.get('release_timestamp')
+                    )
+                    upload_date = normalize_yt_date(raw_date, entry.get('timestamp'))
                     description = entry.get('description')
                     duration = entry.get('duration')
 
-                    # Only do full extraction if we're missing critical metadata
-                    if not upload_date or not duration:
+                    # Full extraction if critical fields are missing
+                    if (not upload_date) or (not duration) or (not description):
                         try:
-                            # Use minimal options - same as old working version
                             full_opts = {
                                 'quiet': True,
                                 'no_warnings': True,
                                 'socket_timeout': 30,
                             }
-                            # Add cookies if available
                             if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
                                 full_opts['cookiefile'] = COOKIES_FILE
 
@@ -267,25 +352,26 @@ def scan_channel(channel_url, custom_name=None, folder=None):
                                     f'https://www.youtube.com/watch?v={vid_id}',
                                     download=False
                                 )
+
                                 if not upload_date:
-                                    upload_date = full_info.get('upload_date') or ''
+                                    raw_full_date = (
+                                        full_info.get('upload_date')
+                                        or full_info.get('release_date')
+                                        or full_info.get('release_timestamp')
+                                    )
+                                    upload_date = normalize_yt_date(raw_full_date, full_info.get('timestamp'))
+
                                 if not description:
                                     description = full_info.get('description')
+
                                 if not duration:
                                     duration = full_info.get('duration')
 
-                                # Fallback to timestamp if upload_date still not available
-                                if not upload_date and full_info.get('timestamp'):
-                                    upload_date = datetime.fromtimestamp(
-                                        full_info['timestamp'], tz=timezone.utc
-                                    ).strftime('%Y%m%d')
                         except Exception as e:
                             add_log(f'      Full metadata extraction failed: {e}', 'error')
-                            # Try timestamp from entry as last resort
-                            if not upload_date and entry.get('timestamp'):
-                                upload_date = datetime.fromtimestamp(
-                                    entry['timestamp'], tz=timezone.utc
-                                ).strftime('%Y%m%d')
+                            # Last fallback from entry timestamp
+                            if not upload_date:
+                                upload_date = normalize_yt_date(None, entry.get('timestamp'))
 
                     write_movie_nfo(
                         nfo_path,
@@ -296,9 +382,12 @@ def scan_channel(channel_url, custom_name=None, folder=None):
                         duration
                     )
                     meta_count += 1
-                    add_log(f'      + NFO metadata')
-                except Exception as e:
-                    add_log(f'      NFO error: {e}', 'error')
+                    if os.path.exists(nfo_path):
+                        add_log(f'      + NFO metadata{" (updated)" if nfo_needs_update(nfo_path) is False else ""}')
+                else:
+                    add_log(f'      NFO up-to-date')
+            except Exception as e:
+                add_log(f'      NFO error: {e}', 'error')
 
             thumb_path = os.path.join(channel_dir, f'{vid_title}-thumb.jpg')
             if not os.path.exists(thumb_path):
@@ -318,9 +407,11 @@ def run_full_scan():
     state['scanning'] = True
     state['results'] = []
     channels = load_channels()
-    add_log(f'Scan started — {len(channels)} channel(s)' +
-            (' [metadata enabled]' if METADATA else '') +
-            (' [cookies loaded]' if COOKIES_FILE and os.path.isfile(COOKIES_FILE) else ' [no cookies]'))
+    add_log(
+        f'Scan started — {len(channels)} channel(s)'
+        + (' [metadata enabled]' if METADATA else '')
+        + (' [cookies loaded]' if COOKIES_FILE and os.path.isfile(COOKIES_FILE) else ' [no cookies]')
+    )
 
     for i, ch in enumerate(channels):
         label = ch.get('name') or ch['url']
@@ -358,8 +449,8 @@ def api_get_channels():
 @app.route('/api/channels', methods=['POST'])
 def api_add_channel():
     data = request.json or {}
-    url    = data.get('url', '').strip()
-    name   = data.get('name', '').strip() or None
+    url = data.get('url', '').strip()
+    name = data.get('name', '').strip() or None
     folder = data.get('folder', '').strip() or None
     if not url:
         return jsonify({'error': 'URL is required'}), 400
@@ -442,7 +533,7 @@ def api_regenerate():
     """Rewrite every .strm file to use direct YouTube URL format."""
     updated = 0
     skipped = 0
-    errors  = 0
+    errors = 0
     for root, _dirs, files in os.walk(MEDIA_DIR):
         for fname in files:
             if not fname.endswith('.strm'):
@@ -517,10 +608,18 @@ def api_debug(video_id):
                 f'https://www.youtube.com/watch?v={video_id}',
                 download=False
             )
+            normalized_date = normalize_yt_date(
+                info.get('upload_date') or info.get('release_date') or info.get('release_timestamp'),
+                info.get('timestamp')
+            )
             result['metadata'] = {
                 'title': info.get('title'),
                 'uploader': info.get('uploader'),
                 'upload_date': info.get('upload_date'),
+                'release_date': info.get('release_date'),
+                'timestamp': info.get('timestamp'),
+                'normalized_date': normalized_date,
+                'normalized_iso_date': yyyymmdd_to_iso(normalized_date) if normalized_date else None,
                 'duration': info.get('duration'),
                 'description': info.get('description', '')[:200] + '...' if info.get('description') else None,
                 'height': info.get('height'),
