@@ -257,8 +257,6 @@ def scan_channel(channel_url, custom_name=None, folder=None):
                                 'quiet': True,
                                 'no_warnings': True,
                                 'socket_timeout': 30,
-                                'skip_download': True,      # Don't try to extract formats
-                                'noplaylist': True,          # Ignore playlists
                             }
                             # Add cookies if available
                             if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
