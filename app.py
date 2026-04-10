@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-yt2strm - Lightweight YouTube-to-STRM server for Emby/Jellyfin
-FIXED: Improved audio dropout handling for longer videos
-FIXED: Added cookie support for YouTube bot detection
+yt2strm - Lightweight YouTube-to-STRM creator for Emby/Jellyfin
+Creates .strm files with direct YouTube URLs, NFO metadata, and thumbnails
 """
 
-from flask import Flask, redirect, request, jsonify, Response, render_template_string
+from flask import Flask, request, jsonify, render_template_string
 from html import escape as html_escape
 import yt_dlp
 import json
 import os
 import re
-import subprocess
 import requests as http_req
 import threading
 import time
@@ -22,23 +20,17 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger('yt2strm')
 
-VERSION = '0.5.0'  # Version number
+VERSION = '1.0.0'  # Simplified version
 
 # ── Config from environment ──────────────────────────────────────
 HOST         = os.environ.get('YT2STRM_HOST', '0.0.0.0')
 PORT         = int(os.environ.get('YT2STRM_PORT', 5000))
-EXTERNAL_URL = os.environ.get('YT2STRM_URL', '').rstrip('/')
 MEDIA_DIR    = os.environ.get('YT2STRM_MEDIA', '/media/YouTube')
 DATA_DIR     = os.environ.get('YT2STRM_DATA', '/data')
 SCAN_INTERVAL= int(os.environ.get('YT2STRM_INTERVAL', 1)) * 3600   # hours between scans, 0=off
 VIDEO_LIMIT  = int(os.environ.get('YT2STRM_LIMIT', 50))
-MODE         = os.environ.get('YT2STRM_MODE', 'redirect')       # redirect, bridge, or proxy
 METADATA     = os.environ.get('YT2STRM_METADATA', 'true').lower() in ('true', '1', 'yes')
-PLAY_HEIGHT  = int(os.environ.get('YT2STRM_PLAY_HEIGHT', 0))    # max height for play/bridge mode, 0=auto
 COOKIES_FILE = os.environ.get('YT2STRM_COOKIES', '').strip()     # path to cookies.txt file
-
-if not EXTERNAL_URL:
-    EXTERNAL_URL = f'http://localhost:{PORT}'
 
 CHANNELS_FILE = os.path.join(DATA_DIR, 'channels.json')
 
@@ -53,7 +45,7 @@ state = {
 def add_log(msg, level='info'):
     ts = datetime.now().strftime('%H:%M:%S')
     state['logs'].append({'time': ts, 'msg': msg, 'level': level})
-    state['logs'] = state['logs'][-500:]  # Keep more logs for detailed scanning
+    state['logs'] = state['logs'][-500:]  # Keep last 500 logs
     getattr(logger, level, logger.info)(msg)
 
 def get_ytdlp_base_opts():
@@ -87,14 +79,6 @@ def sanitize(name):
     name = re.sub(r'[<>:"/\\|?*\n\r\t]', '', str(name))
     name = name.strip('. ')
     return name[:200] if name else 'Untitled'
-
-def get_mode_endpoint():
-    """Return the URL path segment for the current mode."""
-    if MODE == 'proxy':
-        return 'proxy'
-    if MODE == 'bridge':
-        return 'bridge'
-    return 'play'
 
 def xml_escape(text):
     """Escape text for safe inclusion in XML content."""
@@ -181,104 +165,13 @@ def write_movie_nfo(path, title, video_id, upload_date=None, description=None, d
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines) + '\n')
 
-def write_episode_nfo(path, title, video_id, upload_date=None, description=None, show_title=None, duration=None):
-    """Write a Kodi/Emby-compatible episode NFO file."""
-    lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<episodedetails>']
-    lines.append(f'  <title>{xml_escape(title)}</title>')
-    if show_title:
-        lines.append(f'  <showtitle>{xml_escape(show_title)}</showtitle>')
-
-    # Build tagline with year and duration
-    tagline_parts = []
-    if upload_date and len(str(upload_date)) >= 8:
-        year = str(upload_date)[:4]
-        tagline_parts.append(year)
-    if duration:
-        duration_str = format_duration(duration)
-        if duration_str:
-            tagline_parts.append(duration_str)
-    if tagline_parts:
-        tagline = " - ".join(tagline_parts)
-        lines.append(f'  <tagline>{xml_escape(tagline)}</tagline>')
-
-    if description:
-        lines.append(f'  <plot>{xml_escape(description)}</plot>')
-    if upload_date and len(str(upload_date)) >= 8:
-        d = str(upload_date)[:8]
-        aired = f'{d[:4]}-{d[4:6]}-{d[6:8]}'
-        lines.append(f'  <aired>{aired}</aired>')
-        lines.append(f'  <year>{d[:4]}</year>')
-    lines.append(f'  <uniqueid type="youtube">{xml_escape(video_id)}</uniqueid>')
-    lines.append('</episodedetails>')
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
-
-def write_tvshow_nfo(path, name, channel_id=None, description=None):
-    """Write a tvshow.nfo for the channel folder."""
-    lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<tvshow>']
-    lines.append(f'  <title>{xml_escape(name)}</title>')
-    if description:
-        lines.append(f'  <plot>{xml_escape(description)}</plot>')
-    if channel_id:
-        lines.append(f'  <uniqueid type="youtube">{xml_escape(channel_id)}</uniqueid>')
-    lines.append('</tvshow>')
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
-
-def get_video_url(video_id):
-    """Resolve a fresh direct stream URL (single muxed file, caps at ~720p)."""
-    # Build format selector based on PLAY_HEIGHT config
-    if PLAY_HEIGHT > 0:
-        # Force specific height: try exact match, then best available up to that height
-        format_str = f'best[ext=mp4][height={PLAY_HEIGHT}]/best[ext=mp4][height<={PLAY_HEIGHT}]/best[ext=mp4]/best'
-    else:
-        # Auto mode: try to get best available (usually caps at 360p or 720p for muxed streams)
-        format_str = 'best[ext=mp4][height<=1080]/best[ext=mp4]/best'
-
-    opts = get_ytdlp_base_opts()
-    opts['format'] = format_str
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(
-            f'https://www.youtube.com/watch?v={video_id}',
-            download=False
-        )
-        return info.get('url')
-
-def get_proxy_urls(video_id):
-    """Resolve separate video + audio URLs for ffmpeg muxing (up to 1080p).
-
-    Excludes AV1 codec for compatibility with older devices like Nvidia Shield.
-    Prefers H.264 (avc1) which is universally supported.
-    """
-    opts = get_ytdlp_base_opts()
-    opts['format'] = (
-        # Prefer H.264 up to configured height, exclude AV1
-        'bestvideo[height<=1080][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/'
-        'bestvideo[height<=1080][ext=mp4][vcodec!=av01][vcodec!=vp9]+bestaudio[ext=m4a]/'
-        'bestvideo[height<=1080][ext=mp4][vcodec!=av01]+bestaudio/'
-        'best[ext=mp4]/best'
-    )
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(
-            f'https://www.youtube.com/watch?v={video_id}',
-            download=False
-        )
-        if 'requested_formats' in info:
-            vf = info['requested_formats'][0]
-            af = info['requested_formats'][1]
-            return vf['url'], af['url'], vf.get('height', '?')
-        return info['url'], None, info.get('height', '?')
-
-def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie'):
+def scan_channel(channel_url, custom_name=None, folder=None):
     """List videos in a channel/playlist, create .strm + metadata files.
 
     Args:
         channel_url: YouTube channel or playlist URL
         custom_name: Optional custom display name
         folder: Optional folder to organize channels
-        content_type: 'movie' or 'tv' - determines NFO format
     """
     opts = get_ytdlp_base_opts()
     opts['extract_flat'] = 'in_playlist'
@@ -302,20 +195,6 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
 
     # ── Channel-level metadata ───────────────────────────────────
     if METADATA:
-        # Create tvshow.nfo only if content_type is 'tv'
-        if content_type == 'tv':
-            tvshow_nfo_path = os.path.join(channel_dir, 'tvshow.nfo')
-            if not os.path.exists(tvshow_nfo_path):
-                try:
-                    write_tvshow_nfo(
-                        tvshow_nfo_path, name,
-                        info.get('channel_id') or info.get('id'),
-                        info.get('description')
-                    )
-                    add_log(f'  Created tvshow.nfo for {name}')
-                except Exception as e:
-                    add_log(f'  tvshow.nfo error: {e}', 'error')
-
         poster_path = os.path.join(channel_dir, 'poster.jpg')
         if not os.path.exists(poster_path):
             thumbs = info.get('thumbnails') or []
@@ -328,7 +207,6 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
 
     # ── Per-video files ──────────────────────────────────────────
     entries = info.get('entries') or []
-    endpoint = get_mode_endpoint()
     new_count = 0
     meta_count = 0
     thumb_count = 0
@@ -349,7 +227,7 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
         if not os.path.exists(strm_path):
             try:
                 with open(strm_path, 'w', encoding='utf-8') as f:
-                    f.write(f'{EXTERNAL_URL}/{endpoint}/{vid_id}')
+                    f.write(f'https://www.youtube.com/watch?v={vid_id}')
                 new_count += 1
                 add_log(f'  [{idx}/{total_entries}] Created: {vid_title}.strm')
             except OSError as e:
@@ -393,26 +271,14 @@ def scan_channel(channel_url, custom_name=None, folder=None, content_type='movie
                                     entry['timestamp'], tz=timezone.utc
                                 ).strftime('%Y%m%d')
 
-                    # Use appropriate NFO format based on content_type
-                    if content_type == 'tv':
-                        write_episode_nfo(
-                            nfo_path,
-                            entry.get('title') or vid_id,
-                            vid_id,
-                            upload_date,
-                            description,
-                            show_title=name,  # Use display name as show title
-                            duration=duration
-                        )
-                    else:  # default to movie
-                        write_movie_nfo(
-                            nfo_path,
-                            entry.get('title') or vid_id,
-                            vid_id,
-                            upload_date,
-                            description,
-                            duration=duration
-                        )
+                    write_movie_nfo(
+                        nfo_path,
+                        entry.get('title') or vid_id,
+                        vid_id,
+                        upload_date,
+                        description,
+                        duration
+                    )
                     meta_count += 1
                     add_log(f'      + NFO metadata')
                 except Exception as e:
@@ -443,12 +309,11 @@ def run_full_scan():
     for i, ch in enumerate(channels):
         label = ch.get('name') or ch['url']
         folder = ch.get('folder')
-        content_type = ch.get('content_type', 'movie')  # default to movie if not specified
         if folder:
             label = f'{folder}/{label}'
         add_log(f'[{i+1}/{len(channels)}] Scanning: {label}')
         try:
-            count, resolved = scan_channel(ch['url'], ch.get('name'), folder, content_type)
+            count, resolved = scan_channel(ch['url'], ch.get('name'), folder)
             display = f'{folder}/{resolved}' if folder else resolved
             state['results'].append({'channel': display, 'new': count, 'status': 'ok'})
             add_log(f'[{i+1}/{len(channels)}] ✓ {display} complete')
@@ -468,200 +333,6 @@ def background_scanner():
             run_full_scan()
         time.sleep(max(SCAN_INTERVAL, 60))
 
-# ── Stream routes ────────────────────────────────────────────────
-
-@app.route('/play/<video_id>')
-def play(video_id):
-    """Redirect mode — fast, lightweight."""
-    try:
-        url = get_video_url(video_id)
-        if url:
-            return redirect(url, 302)
-        return 'Could not resolve video', 502
-    except Exception as e:
-        add_log(f'Play error {video_id}: {e}', 'error')
-        return f'Error: {e}', 502
-
-@app.route('/bridge/<video_id>')
-def bridge(video_id):
-    """Bridge mode — uses best available quality, muxing with ffmpeg if needed."""
-    try:
-        # Try to get high-quality separate streams first
-        video_url, audio_url, height = get_proxy_urls(video_id)
-
-        # If we have separate streams and PLAY_HEIGHT is set, use ffmpeg to mux
-        if audio_url and PLAY_HEIGHT > 0:
-            add_log(f'Bridge muxing {video_id}: {height}p with ffmpeg')
-            cmd = [
-                'ffmpeg',
-                '-hide_banner', '-loglevel', 'error',
-                '-headers', 'User-Agent: Mozilla/5.0\r\n',
-                '-reconnect', '1',
-                '-reconnect_streamed', '1',
-                '-reconnect_delay_max', '5',
-                '-i', video_url,
-                '-headers', 'User-Agent: Mozilla/5.0\r\n',
-                '-reconnect', '1',
-                '-reconnect_streamed', '1',
-                '-reconnect_delay_max', '5',
-                '-i', audio_url,
-                '-c:v', 'copy',
-                '-c:a', 'copy',
-                '-movflags', 'frag_keyframe+empty_moov',
-                '-f', 'mp4',
-                'pipe:1',
-            ]
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-
-            def generate():
-                try:
-                    fd = process.stdout.fileno()
-                    while True:
-                        chunk = os.read(fd, 256 * 1024)
-                        if not chunk:
-                            break
-                        yield chunk
-                except (GeneratorExit, BrokenPipeError):
-                    pass
-                except Exception as e:
-                    add_log(f'Bridge stream error {video_id}: {e}', 'error')
-                finally:
-                    try:
-                        process.kill()
-                    except OSError:
-                        pass
-                    process.wait()
-
-            return Response(
-                generate(),
-                mimetype='video/mp4',
-                headers={'Accept-Ranges': 'none'}
-            )
-        else:
-            # Fall back to simple muxed stream
-            url = get_video_url(video_id)
-            if not url:
-                return 'Could not resolve video', 502
-
-            r = http_req.get(url, stream=True, timeout=30,
-                             headers={'User-Agent': 'Mozilla/5.0'})
-
-            def generate():
-                try:
-                    for chunk in r.iter_content(chunk_size=512 * 1024):
-                        if chunk:
-                            yield chunk
-                except (GeneratorExit, BrokenPipeError):
-                    pass
-                except Exception as e:
-                    add_log(f'Bridge fallback error {video_id}: {e}', 'error')
-                finally:
-                    r.close()
-
-            headers = {
-                'Content-Type': r.headers.get('Content-Type', 'video/mp4'),
-                'Accept-Ranges': 'none',
-            }
-            if 'Content-Length' in r.headers:
-                headers['Content-Length'] = r.headers['Content-Length']
-
-            return Response(generate(), headers=headers)
-    except Exception as e:
-        add_log(f'Bridge error {video_id}: {e}', 'error')
-        return f'Error: {e}', 502
-
-@app.route('/proxy/<video_id>')
-def proxy(video_id):
-    """Proxy mode — muxes best video + best audio via ffmpeg for up to 1080p.
-
-    FIXED: Added reconnection flags to handle longer videos and prevent audio dropouts.
-    """
-    try:
-        video_url, audio_url, height = get_proxy_urls(video_id)
-        add_log(f'Proxy resolve {video_id}: {height}p, separate_audio={audio_url is not None}')
-
-        if audio_url:
-            # FIX: Added reconnection flags to prevent dropouts on longer videos
-            cmd = [
-                'ffmpeg',
-                '-hide_banner', '-loglevel', 'error',
-                # Video input with reconnection support
-                '-headers', 'User-Agent: Mozilla/5.0\r\n',
-                '-reconnect', '1',
-                '-reconnect_streamed', '1',
-                '-reconnect_delay_max', '5',
-                '-i', video_url,
-                # Audio input with reconnection support
-                '-headers', 'User-Agent: Mozilla/5.0\r\n',
-                '-reconnect', '1',
-                '-reconnect_streamed', '1',
-                '-reconnect_delay_max', '5',
-                '-i', audio_url,
-                # Copy codecs (no re-encoding)
-                '-c:v', 'copy',
-                '-c:a', 'copy',
-                # MP4 fragmentation for streaming
-                '-movflags', 'frag_keyframe+empty_moov',
-                '-f', 'mp4',
-                'pipe:1',
-            ]
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-
-            def generate():
-                try:
-                    fd = process.stdout.fileno()
-                    while True:
-                        chunk = os.read(fd, 256 * 1024)
-                        if not chunk:
-                            break
-                        yield chunk
-                except (GeneratorExit, BrokenPipeError):
-                    # Client disconnected - this is normal
-                    pass
-                except Exception as e:
-                    # Log unexpected errors
-                    add_log(f'Proxy stream error {video_id}: {e}', 'error')
-                finally:
-                    try:
-                        process.kill()
-                    except OSError:
-                        pass
-                    process.wait()
-
-            return Response(
-                generate(),
-                mimetype='video/mp4',
-                headers={'Accept-Ranges': 'none'}
-            )
-        else:
-            r = http_req.get(video_url, stream=True, timeout=30,
-                             headers={'User-Agent': 'Mozilla/5.0'})
-
-            def generate():
-                try:
-                    for chunk in r.iter_content(chunk_size=256 * 1024):
-                        if chunk:
-                            yield chunk
-                except (GeneratorExit, BrokenPipeError):
-                    pass
-                except Exception as e:
-                    add_log(f'Proxy fallback error {video_id}: {e}', 'error')
-                finally:
-                    r.close()
-
-            return Response(
-                generate(),
-                mimetype='video/mp4',
-                headers={'Accept-Ranges': 'none'}
-            )
-    except Exception as e:
-        add_log(f'Proxy error {video_id}: {e}', 'error')
-        return f'Error: {e}', 502
-
 # ── API routes ───────────────────────────────────────────────────
 
 @app.route('/api/channels', methods=['GET'])
@@ -674,16 +345,13 @@ def api_add_channel():
     url    = data.get('url', '').strip()
     name   = data.get('name', '').strip() or None
     folder = data.get('folder', '').strip() or None
-    content_type = data.get('content_type', 'movie').strip()  # default to movie
     if not url:
         return jsonify({'error': 'URL is required'}), 400
-    if content_type not in ('movie', 'tv'):
-        content_type = 'movie'  # fallback to movie if invalid
     channels = load_channels()
-    channels.append({'url': url, 'name': name, 'folder': folder, 'content_type': content_type})
+    channels.append({'url': url, 'name': name, 'folder': folder})
     save_channels(channels)
     label = f'{folder}/{name or url}' if folder else (name or url)
-    add_log(f'Added: {label} (type: {content_type})')
+    add_log(f'Added: {label}')
     return jsonify({'status': 'ok', 'channels': channels})
 
 @app.route('/api/channels/<int:idx>', methods=['PUT'])
@@ -698,10 +366,6 @@ def api_edit_channel(idx):
         channels[idx]['name'] = data['name'].strip() or None
     if 'folder' in data:
         channels[idx]['folder'] = data['folder'].strip() or None
-    if 'content_type' in data:
-        content_type = data['content_type'].strip()
-        if content_type in ('movie', 'tv'):
-            channels[idx]['content_type'] = content_type
     save_channels(channels)
     add_log(f'Updated channel {idx}')
     return jsonify({'status': 'ok', 'channels': channels})
@@ -739,12 +403,11 @@ def api_scan_single(idx):
         ch = channels[idx]
         label = ch.get('name') or ch['url']
         folder = ch.get('folder')
-        content_type = ch.get('content_type', 'movie')
         if folder:
             label = f'{folder}/{label}'
         add_log(f'Scanning single channel: {label}')
         try:
-            count, resolved = scan_channel(ch['url'], ch.get('name'), folder, content_type)
+            count, resolved = scan_channel(ch['url'], ch.get('name'), folder)
             display = f'{folder}/{resolved}' if folder else resolved
             state['results'].append({'channel': display, 'new': count, 'status': 'ok'})
             add_log(f'✓ {display} complete')
@@ -760,8 +423,7 @@ def api_scan_single(idx):
 
 @app.route('/api/regenerate', methods=['POST'])
 def api_regenerate():
-    """Rewrite every .strm file so it points at the current mode endpoint."""
-    endpoint = get_mode_endpoint()
+    """Rewrite every .strm file to use direct YouTube URL format."""
     updated = 0
     skipped = 0
     errors  = 0
@@ -773,10 +435,24 @@ def api_regenerate():
             try:
                 with open(path, 'r', encoding='utf-8') as fh:
                     content = fh.read().strip()
-                m = re.search(r'/(play|bridge|proxy)/([A-Za-z0-9_-]+)', content)
-                if m:
-                    vid_id = m.group(2)
-                    new_content = f'{EXTERNAL_URL}/{endpoint}/{vid_id}'
+
+                # Extract video ID from various formats
+                vid_id = None
+
+                # Format 1: Direct YouTube URL
+                if 'youtube.com/watch?v=' in content or 'youtu.be/' in content:
+                    m = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/)([A-Za-z0-9_-]+)', content)
+                    if m:
+                        vid_id = m.group(1)
+
+                # Format 2: Old server format (play/bridge/proxy)
+                if not vid_id:
+                    m = re.search(r'/(play|bridge|proxy)/([A-Za-z0-9_-]+)', content)
+                    if m:
+                        vid_id = m.group(2)
+
+                if vid_id:
+                    new_content = f'https://www.youtube.com/watch?v={vid_id}'
                     if content != new_content:
                         with open(path, 'w', encoding='utf-8') as fh:
                             fh.write(new_content)
@@ -788,83 +464,37 @@ def api_regenerate():
             except Exception as e:
                 errors += 1
                 add_log(f'Regenerate error {path}: {e}', 'error')
-    add_log(f'Regenerate done: {updated} updated, {skipped} already correct, {errors} errors → /{endpoint}/')
-    return jsonify({'status': 'ok', 'updated': updated, 'skipped': skipped,
-                    'errors': errors, 'endpoint': endpoint})
+    add_log(f'Regenerate done: {updated} updated, {skipped} already correct, {errors} errors')
+    return jsonify({'status': 'ok', 'updated': updated, 'skipped': skipped, 'errors': errors})
 
 @app.route('/api/debug/<video_id>', methods=['GET'])
 def api_debug(video_id):
-    """Show what yt-dlp resolves for a video in each mode."""
-    result = {'video_id': video_id, 'current_mode': MODE, 'play_height_config': PLAY_HEIGHT,
-              'cookies_loaded': bool(COOKIES_FILE and os.path.isfile(COOKIES_FILE))}
+    """Verify that video metadata can be fetched."""
+    result = {
+        'video_id': video_id,
+        'cookies_loaded': bool(COOKIES_FILE and os.path.isfile(COOKIES_FILE))
+    }
 
     try:
-        # Use the same format logic as get_video_url()
-        if PLAY_HEIGHT > 0:
-            format_str = f'best[ext=mp4][height={PLAY_HEIGHT}]/best[ext=mp4][height<={PLAY_HEIGHT}]/best[ext=mp4]/best'
-        else:
-            format_str = 'best[ext=mp4][height<=1080]/best[ext=mp4]/best'
-
         opts = get_ytdlp_base_opts()
-        opts['format'] = format_str
-
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(
-                f'https://www.youtube.com/watch?v={video_id}', download=False)
-            result['play_mode'] = {
+                f'https://www.youtube.com/watch?v={video_id}',
+                download=False
+            )
+            result['metadata'] = {
+                'title': info.get('title'),
+                'uploader': info.get('uploader'),
+                'upload_date': info.get('upload_date'),
+                'duration': info.get('duration'),
+                'description': info.get('description', '')[:200] + '...' if info.get('description') else None,
                 'height': info.get('height'),
-                'ext': info.get('ext'),
                 'format': info.get('format'),
-                'vcodec': info.get('vcodec'),
-                'acodec': info.get('acodec'),
-                'format_selector': format_str,
             }
+            result['status'] = 'ok'
     except Exception as e:
-        result['play_mode'] = {'error': str(e)}
-
-    try:
-        opts = get_ytdlp_base_opts()
-        opts['format'] = (
-            'bestvideo[height<=1080][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/'
-            'bestvideo[height<=1080][ext=mp4][vcodec!=av01][vcodec!=vp9]+bestaudio[ext=m4a]/'
-            'bestvideo[height<=1080][ext=mp4][vcodec!=av01]+bestaudio/'
-            'best[ext=mp4]/best'
-        )
-
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(
-                f'https://www.youtube.com/watch?v={video_id}', download=False)
-            if 'requested_formats' in info:
-                vf = info['requested_formats'][0]
-                af = info['requested_formats'][1]
-                result['proxy_mode'] = {
-                    'video': {
-                        'height': vf.get('height'),
-                        'ext': vf.get('ext'),
-                        'format': vf.get('format'),
-                        'vcodec': vf.get('vcodec'),
-                    },
-                    'audio': {
-                        'ext': af.get('ext'),
-                        'format': af.get('format'),
-                        'acodec': af.get('acodec'),
-                    },
-                }
-            else:
-                result['proxy_mode'] = {
-                    'single_stream': True,
-                    'height': info.get('height'),
-                    'ext': info.get('ext'),
-                    'format': info.get('format'),
-                }
-    except Exception as e:
-        result['proxy_mode'] = {'error': str(e)}
-
-    try:
-        r = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, timeout=5)
-        result['ffmpeg'] = r.stdout.split('\n')[0] if r.returncode == 0 else 'not working'
-    except Exception:
-        result['ffmpeg'] = 'not found'
+        result['status'] = 'error'
+        result['error'] = str(e)
 
     return jsonify(result)
 
@@ -877,13 +507,10 @@ def api_status():
 @app.route('/')
 def index():
     return render_template_string(HTML, conf={
-        'external_url': EXTERNAL_URL,
-        'mode': MODE,
         'media_dir': MEDIA_DIR,
         'scan_interval': SCAN_INTERVAL // 3600 if SCAN_INTERVAL > 0 else 0,  # Convert to hours
         'video_limit': VIDEO_LIMIT,
         'metadata': METADATA,
-        'play_height': PLAY_HEIGHT,
         'version': VERSION,
         'cookies': bool(COOKIES_FILE and os.path.isfile(COOKIES_FILE)),
         'cookies_path': COOKIES_FILE or '(not set)',
@@ -977,13 +604,9 @@ HTML = r"""<!DOCTYPE html>
   <div class="row">
     <input type="text" id="chName" placeholder="Display name (optional)">
     <input type="text" id="chFolder" placeholder="Folder (optional)">
-    <select id="chContentType" style="padding:.55rem .7rem;border-radius:6px;border:1px solid var(--border);background:#12141c;color:var(--text);font-size:.9rem;">
-      <option value="movie">Movie</option>
-      <option value="tv">TV Series</option>
-    </select>
     <button class="btn-primary" onclick="addChannel()">Add</button>
   </div>
-  <div class="hint">Folder nests inside the media root. Content Type: Movie = all in one folder, TV = organized by seasons.</div>
+  <div class="hint">Folder nests inside the media root. STRM files contain direct YouTube URLs.</div>
 </div>
 
 <!-- Channel List -->
@@ -1006,14 +629,13 @@ HTML = r"""<!DOCTYPE html>
   <h2>🛠️ Tools</h2>
   <div style="margin-bottom:1rem">
     <p style="font-size:.82rem;color:var(--muted);margin-bottom:.5rem">
-      Rewrite all existing .strm files to use the current mode (<b>{{ conf.mode }}</b>).
-      Use this after changing YT2STRM_MODE.
+      Rewrite all existing .strm files to use direct YouTube URLs (https://www.youtube.com/watch?v=VIDEO_ID).
     </p>
     <button class="btn-warn" onclick="regenerateStrms()">🔄 Regenerate All STRMs</button>
     <div class="tool-result" id="regenResult"></div>
   </div>
   <hr style="border-color:var(--border);margin-bottom:1rem">
-  <label>Debug — paste a YouTube video ID to inspect resolution</label>
+  <label>Debug — paste a YouTube video ID to verify metadata can be fetched</label>
   <div class="row">
     <input type="text" id="debugId" placeholder="e.g. dQw4w9WgXcQ">
     <button class="btn-primary" onclick="debugVideo()">Debug</button>
@@ -1025,13 +647,10 @@ HTML = r"""<!DOCTYPE html>
 <div class="card">
   <h2>⚙️ Configuration</h2>
   <dl class="conf-grid">
-    <dt>External URL</dt><dd>{{ conf.external_url }}</dd>
-    <dt>Mode</dt><dd>{{ conf.mode }}</dd>
     <dt>Media folder</dt><dd>{{ conf.media_dir }}</dd>
     <dt>Scan interval</dt><dd>{{ conf.scan_interval }}h</dd>
     <dt>Video limit</dt><dd>{{ conf.video_limit }} per channel</dd>
     <dt>Metadata</dt><dd><span class="conf-badge {{ 'conf-on' if conf.metadata else 'conf-off' }}">{{ 'NFO + thumbnails' if conf.metadata else 'disabled' }}</span></dd>
-    <dt>Play height</dt><dd>{{ conf.play_height if conf.play_height > 0 else 'auto' }}{{ 'p' if conf.play_height > 0 else '' }}</dd>
     <dt>Cookies</dt><dd><span class="conf-badge {{ 'conf-on' if conf.cookies else 'conf-off' }}">{{ 'loaded ✓' if conf.cookies else 'not loaded' }}</span> <span style="font-size:.75rem;color:var(--muted)">{{ conf.cookies_path }}</span></dd>
   </dl>
 </div>
@@ -1047,12 +666,6 @@ HTML = r"""<!DOCTYPE html>
     <input type="text" id="editName" placeholder="(auto-detect)">
     <label>Folder</label>
     <input type="text" id="editFolder" placeholder="(root)">
-    <label>Content Type</label>
-    <select id="editContentType" style="width:100%;padding:.55rem .7rem;border-radius:6px;border:1px solid var(--border);background:#12141c;color:var(--text);font-size:.9rem;margin-bottom:.6rem">
-      <option value="movie">Movie</option>
-      <option value="tv">TV Series</option>
-    </select>
-    <div class="hint">Movie = all in one folder. TV = organized by seasons (Emby auto-sorts).</div>
     <div class="modal-actions">
       <button class="btn-primary" onclick="saveEdit()">Save</button>
       <button style="background:var(--border);color:var(--text)" onclick="closeEdit()">Cancel</button>
@@ -1076,12 +689,10 @@ async function loadChannels(){
   if(!chs.length){ ul.innerHTML='<li class="empty">No channels yet. Add one above.</li>'; return; }
   ul.innerHTML = chs.map((c,i)=>{
     const folderBadge = c.folder ? `<span class="ch-folder">${esc(c.folder)}</span>` : '';
-    const contentType = c.content_type || 'movie';
-    const typeBadge = `<span class="ch-folder" style="background:${contentType==='tv'?'#2a4026':'#402a26'};color:${contentType==='tv'?'#4caf93':'#e74c5f'}">${contentType==='tv'?'TV':'Movie'}</span>`;
     return `
     <li class="ch-item">
       <div>
-        ${folderBadge}${typeBadge}<span class="ch-name">${esc(c.name||'(auto)')}</span>
+        ${folderBadge}<span class="ch-name">${esc(c.name||'(auto)')}</span>
         <span class="ch-url">${esc(c.url)}</span>
       </div>
       <div class="ch-actions">
@@ -1097,14 +708,12 @@ async function addChannel(){
   const url = document.getElementById('chUrl').value.trim();
   const name = document.getElementById('chName').value.trim();
   const folder = document.getElementById('chFolder').value.trim();
-  const content_type = document.getElementById('chContentType').value;
   if(!url) return;
   await fetchJSON('/api/channels',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({url, name, folder, content_type})});
+    body:JSON.stringify({url, name, folder})});
   document.getElementById('chUrl').value='';
   document.getElementById('chName').value='';
   document.getElementById('chFolder').value='';
-  document.getElementById('chContentType').value='movie';
   loadChannels();
 }
 
@@ -1125,7 +734,6 @@ function openEdit(idx){
     document.getElementById('editUrl').value = c.url||'';
     document.getElementById('editName').value = c.name||'';
     document.getElementById('editFolder').value = c.folder||'';
-    document.getElementById('editContentType').value = c.content_type||'movie';
     document.getElementById('editModal').classList.add('open');
   });
 }
@@ -1139,9 +747,8 @@ async function saveEdit(){
   const url = document.getElementById('editUrl').value.trim();
   const name = document.getElementById('editName').value.trim();
   const folder = document.getElementById('editFolder').value.trim();
-  const content_type = document.getElementById('editContentType').value;
   await fetchJSON('/api/channels/'+idx,{method:'PUT',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({url, name, folder, content_type})});
+    body:JSON.stringify({url, name, folder})});
   closeEdit();
   loadChannels();
 }
@@ -1157,7 +764,7 @@ async function regenerateStrms(){
   try{
     const r = await fetchJSON('/api/regenerate',{method:'POST'});
     el.className='tool-result ok';
-    el.textContent=`Done — ${r.updated} updated, ${r.skipped} already correct, ${r.errors} errors → /${r.endpoint}/`;
+    el.textContent=`Done — ${r.updated} updated, ${r.skipped} already correct, ${r.errors} errors`;
   }catch(e){
     el.className='tool-result err';
     el.textContent='Error: '+e;
@@ -1170,7 +777,7 @@ async function debugVideo(){
   if(!id) return;
   const out = document.getElementById('debugOutput');
   out.style.display='block';
-  out.textContent='Resolving… (this takes a few seconds)';
+  out.textContent='Fetching metadata...';
   try{
     const r = await fetchJSON('/api/debug/'+id);
     out.textContent = JSON.stringify(r, null, 2);
@@ -1219,7 +826,7 @@ if __name__ == '__main__':
     os.makedirs(MEDIA_DIR, exist_ok=True)
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    add_log(f'yt2strm starting — {EXTERNAL_URL} — mode={MODE}')
+    add_log(f'yt2strm v{VERSION} starting')
     add_log(f'Metadata: {"enabled (NFO + thumbnails)" if METADATA else "disabled"}')
 
     # Cookie status
@@ -1230,16 +837,6 @@ if __name__ == '__main__':
             add_log(f'Cookies file not found: {COOKIES_FILE} — YouTube may block requests!', 'error')
     else:
         add_log('No cookies configured (YT2STRM_COOKIES) — YouTube may block requests', 'error')
-
-    if MODE in ('proxy', 'bridge'):
-        try:
-            r = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, timeout=5)
-            if r.returncode == 0:
-                add_log(f'ffmpeg found: {r.stdout.split(chr(10))[0]}')
-            else:
-                add_log('ffmpeg not working — proxy/bridge mode will fail!', 'error')
-        except FileNotFoundError:
-            add_log('ffmpeg not found — proxy/bridge mode requires ffmpeg!', 'error')
 
     if SCAN_INTERVAL > 0:
         threading.Thread(target=background_scanner, daemon=True).start()
