@@ -117,7 +117,7 @@ def download_image(url, dest_path):
     return False
 
 def format_duration(seconds):
-    """Convert seconds to human-readable duration format."""
+    """Convert seconds to compact duration format (e.g., '1min 43sec' or '1h 23min 45sec')."""
     if not seconds:
         return None
 
@@ -127,39 +127,43 @@ def format_duration(seconds):
 
     parts = []
     if hours > 0:
-        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+        parts.append(f"{hours}h")
     if minutes > 0:
-        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+        parts.append(f"{minutes}min")
     if secs > 0 or not parts:  # Always show seconds if no hours/minutes
-        parts.append(f"{secs} second{'s' if secs != 1 else ''}")
+        parts.append(f"{secs}sec")
 
-    return ", ".join(parts)
+    return " ".join(parts)
 
 def write_movie_nfo(path, title, video_id, upload_date=None, description=None, duration=None):
     """Write a Kodi/Emby-compatible movie NFO file."""
     lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<movie>']
     lines.append(f'  <title>{xml_escape(title)}</title>')
 
-    # Build tagline with year and duration
+    # Build tagline: "YYYY-MM-DD, Xmin Ysec" or just "Xmin Ysec" if no date
     tagline_parts = []
     if upload_date and len(str(upload_date)) >= 8:
-        year = str(upload_date)[:4]
-        tagline_parts.append(year)
+        d = str(upload_date)[:8]
+        formatted_date = f'{d[:4]}-{d[4:6]}-{d[6:8]}'
+        tagline_parts.append(formatted_date)
     if duration:
         duration_str = format_duration(duration)
         if duration_str:
             tagline_parts.append(duration_str)
     if tagline_parts:
-        tagline = " - ".join(tagline_parts)
+        tagline = ", ".join(tagline_parts)
         lines.append(f'  <tagline>{xml_escape(tagline)}</tagline>')
 
     if description:
         lines.append(f'  <plot>{xml_escape(description)}</plot>')
+
+    # Add releasedate tag in DD/MM/YYYY format if upload_date is available
     if upload_date and len(str(upload_date)) >= 8:
         d = str(upload_date)[:8]
-        premiered = f'{d[:4]}-{d[4:6]}-{d[6:8]}'
-        lines.append(f'  <premiered>{premiered}</premiered>')
+        release_date = f'{d[6:8]}/{d[4:6]}/{d[:4]}'
+        lines.append(f'  <releasedate>{release_date}</releasedate>')
         lines.append(f'  <year>{d[:4]}</year>')
+
     lines.append(f'  <uniqueid type="youtube">{xml_escape(video_id)}</uniqueid>')
     lines.append('</movie>')
     with open(path, 'w', encoding='utf-8') as f:
