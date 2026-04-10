@@ -244,36 +244,38 @@ def scan_channel(channel_url, custom_name=None, folder=None):
             nfo_path = os.path.join(channel_dir, f'{vid_title}.nfo')
             if not os.path.exists(nfo_path):
                 try:
-                    # Fetch full metadata if not available from flat extraction
-                    upload_date = entry.get('upload_date') or ''
-                    description = entry.get('description')
-                    duration = entry.get('duration')  # Duration in seconds
+                    # Always do full extraction to get complete metadata
+                    # Flat extraction often misses upload_date and description
+                    upload_date = ''
+                    description = None
+                    duration = None
 
-                    if not upload_date or not duration:
-                        # Do a full extraction to get missing metadata
-                        try:
-                            full_opts = get_ytdlp_base_opts()
-                            with yt_dlp.YoutubeDL(full_opts) as ydl_full:
-                                full_info = ydl_full.extract_info(
-                                    f'https://www.youtube.com/watch?v={vid_id}',
-                                    download=False
-                                )
-                                if not upload_date:
-                                    upload_date = full_info.get('upload_date') or ''
-                                if not description:
-                                    description = full_info.get('description')
-                                if not duration:
-                                    duration = full_info.get('duration')
-                                if not upload_date and full_info.get('timestamp'):
-                                    upload_date = datetime.fromtimestamp(
-                                        full_info['timestamp'], tz=timezone.utc
-                                    ).strftime('%Y%m%d')
-                        except Exception:
-                            # If full extraction fails, try timestamp from entry
-                            if entry.get('timestamp'):
+                    try:
+                        full_opts = get_ytdlp_base_opts()
+                        with yt_dlp.YoutubeDL(full_opts) as ydl_full:
+                            full_info = ydl_full.extract_info(
+                                f'https://www.youtube.com/watch?v={vid_id}',
+                                download=False
+                            )
+                            upload_date = full_info.get('upload_date') or ''
+                            description = full_info.get('description')
+                            duration = full_info.get('duration')
+
+                            # Fallback to timestamp if upload_date not available
+                            if not upload_date and full_info.get('timestamp'):
                                 upload_date = datetime.fromtimestamp(
-                                    entry['timestamp'], tz=timezone.utc
+                                    full_info['timestamp'], tz=timezone.utc
                                 ).strftime('%Y%m%d')
+                    except Exception as e:
+                        add_log(f'      Full metadata extraction failed: {e}', 'error')
+                        # Try timestamp from entry as last resort
+                        if entry.get('timestamp'):
+                            upload_date = datetime.fromtimestamp(
+                                entry['timestamp'], tz=timezone.utc
+                            ).strftime('%Y%m%d')
+                        # Use any data from flat extraction
+                        duration = entry.get('duration')
+                        description = entry.get('description')
 
                     write_movie_nfo(
                         nfo_path,
@@ -471,6 +473,25 @@ def api_regenerate():
     add_log(f'Regenerate done: {updated} updated, {skipped} already correct, {errors} errors')
     return jsonify({'status': 'ok', 'updated': updated, 'skipped': skipped, 'errors': errors})
 
+@app.route('/api/regenerate-nfo', methods=['POST'])
+def api_regenerate_nfo():
+    """Delete all NFO files to force regeneration on next scan."""
+    deleted = 0
+    errors = 0
+    for root, _dirs, files in os.walk(MEDIA_DIR):
+        for fname in files:
+            if not fname.endswith('.nfo'):
+                continue
+            path = os.path.join(root, fname)
+            try:
+                os.remove(path)
+                deleted += 1
+            except Exception as e:
+                errors += 1
+                add_log(f'Delete NFO error {path}: {e}', 'error')
+    add_log(f'Deleted {deleted} NFO files, {errors} errors')
+    return jsonify({'status': 'ok', 'deleted': deleted, 'errors': errors})
+
 @app.route('/api/debug/<video_id>', methods=['GET'])
 def api_debug(video_id):
     """Verify that video metadata can be fetched."""
@@ -639,6 +660,14 @@ HTML = r"""<!DOCTYPE html>
     <div class="tool-result" id="regenResult"></div>
   </div>
   <hr style="border-color:var(--border);margin-bottom:1rem">
+  <div style="margin-bottom:1rem">
+    <p style="font-size:.82rem;color:var(--muted);margin-bottom:.5rem">
+      Delete all NFO files and run a full scan to regenerate metadata with the latest format (tagline, releasedate, etc.).
+    </p>
+    <button class="btn-warn" onclick="regenerateNfo()">🔄 Regenerate All NFO Files</button>
+    <div class="tool-result" id="nfoResult"></div>
+  </div>
+  <hr style="border-color:var(--border);margin-bottom:1rem">
   <label>Debug — paste a YouTube video ID to verify metadata can be fetched</label>
   <div class="row">
     <input type="text" id="debugId" placeholder="e.g. dQw4w9WgXcQ">
@@ -774,6 +803,23 @@ async function regenerateStrms(){
     el.textContent='Error: '+e;
   }
   pollStatus();
+}
+
+async function regenerateNfo(){
+  if(!confirm('This will delete ALL NFO files and trigger a full rescan. This may take a while. Continue?')) return;
+  const el = document.getElementById('nfoResult');
+  el.className='tool-result';el.style.display='block';el.textContent='Deleting NFO files...';
+  try{
+    const r = await fetchJSON('/api/regenerate-nfo',{method:'POST'});
+    el.textContent=`Deleted ${r.deleted} NFO files. Starting scan...`;
+    await fetchJSON('/api/scan',{method:'POST'});
+    el.className='tool-result ok';
+    el.textContent=`Deleted ${r.deleted} NFO files. Scan started - check Status section for progress.`;
+    pollStatus();
+  }catch(e){
+    el.className='tool-result err';
+    el.textContent='Error: '+e;
+  }
 }
 
 async function debugVideo(){
