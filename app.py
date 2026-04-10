@@ -244,42 +244,48 @@ def scan_channel(channel_url, custom_name=None, folder=None):
             nfo_path = os.path.join(channel_dir, f'{vid_title}.nfo')
             if not os.path.exists(nfo_path):
                 try:
-                    # Always do full extraction to get complete metadata
-                    # Flat extraction often misses upload_date and description
-                    upload_date = ''
-                    description = None
-                    duration = None
+                    # Get basic metadata from flat extraction
+                    upload_date = entry.get('upload_date') or ''
+                    description = entry.get('description')
+                    duration = entry.get('duration')
 
-                    try:
-                        full_opts = get_ytdlp_base_opts()
-                        # Skip format selection - we only need metadata
-                        full_opts['format'] = 'best'
-                        full_opts['skip_download'] = True
-                        
-                        with yt_dlp.YoutubeDL(full_opts) as ydl_full:
-                            full_info = ydl_full.extract_info(
-                                f'https://www.youtube.com/watch?v={vid_id}',
-                                download=False
-                            )
-                            upload_date = full_info.get('upload_date') or ''
-                            description = full_info.get('description')
-                            duration = full_info.get('duration')
+                    # Only do full extraction if we're missing critical metadata
+                    if not upload_date or not duration:
+                        try:
+                            # Use minimal options - same as old working version
+                            full_opts = {
+                                'quiet': True,
+                                'no_warnings': True,
+                                'socket_timeout': 30,
+                            }
+                            # Add cookies if available
+                            if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
+                                full_opts['cookiefile'] = COOKIES_FILE
 
-                            # Fallback to timestamp if upload_date not available
-                            if not upload_date and full_info.get('timestamp'):
+                            with yt_dlp.YoutubeDL(full_opts) as ydl_full:
+                                full_info = ydl_full.extract_info(
+                                    f'https://www.youtube.com/watch?v={vid_id}',
+                                    download=False
+                                )
+                                if not upload_date:
+                                    upload_date = full_info.get('upload_date') or ''
+                                if not description:
+                                    description = full_info.get('description')
+                                if not duration:
+                                    duration = full_info.get('duration')
+
+                                # Fallback to timestamp if upload_date still not available
+                                if not upload_date and full_info.get('timestamp'):
+                                    upload_date = datetime.fromtimestamp(
+                                        full_info['timestamp'], tz=timezone.utc
+                                    ).strftime('%Y%m%d')
+                        except Exception as e:
+                            add_log(f'      Full metadata extraction failed: {e}', 'error')
+                            # Try timestamp from entry as last resort
+                            if not upload_date and entry.get('timestamp'):
                                 upload_date = datetime.fromtimestamp(
-                                    full_info['timestamp'], tz=timezone.utc
+                                    entry['timestamp'], tz=timezone.utc
                                 ).strftime('%Y%m%d')
-                    except Exception as e:
-                        add_log(f'      Full metadata extraction failed: {e}', 'error')
-                        # Try timestamp from entry as last resort
-                        if entry.get('timestamp'):
-                            upload_date = datetime.fromtimestamp(
-                                entry['timestamp'], tz=timezone.utc
-                            ).strftime('%Y%m%d')
-                        # Use any data from flat extraction
-                        duration = entry.get('duration')
-                        description = entry.get('description')
 
                     write_movie_nfo(
                         nfo_path,
