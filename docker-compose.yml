@@ -1,23 +1,17 @@
 services:
   yt2strm:
-    build: .
+    image: ghcr.io/damoekster/yt2strm:latest
     container_name: yt2strm
-    environment:
-      - YT2STRM_URL=http://192.168.3.109:5000 # ← CHANGE THIS 
-      - YT2STRM_MEDIA=/media
-      - YT2STRM_DATA=/data
-      - YT2STRM_INTERVAL=3600  #scan interval in minutes
-      - YT2STRM_LIMIT=20000  #max number of movies
-      - YT2STRM_MODE=bridge  # Use bridge mode for high-quality with ffmpeg muxing
-      - YT2STRM_PLAY_HEIGHT=720  # Force 720p in play/bridge mode (0=auto, 360/480/720/1080)
-      - YT2STRM_COOKIES=/data/cookies.txt  # ← NEW: path inside container
-    volumes:
-      - yt2strm-data:/data
-      - E:/YOUTUBEstrms:/media
-      - ./cookies.txt:/data/cookies.txt:ro  # ← NEW: mount cookies file
     ports:
-      - 5000:5000
+      - "5000:5000"
+    volumes:
+      - ./data:/data                     # Channel list storage
+      - /path/to/mediafolder:/media      # STRM output folder
+      - ./cookies.txt:/cookies.txt:ro    # Optional: YouTube cookies
+    environment:
+      - YT2STRM_MEDIA=/media             # Where to save STRM files
+      - YT2STRM_INTERVAL=6               # Scan every 6 hours (0 = manual only)
+      - YT2STRM_LIMIT=50                 # Max videos per channel
+      - YT2STRM_METADATA=true            # Enable NFO + thumbnails
+      - YT2STRM_COOKIES=/cookies.txt     # Path to cookies file
     restart: unless-stopped
-volumes:
-  yt2strm-data: null
-networks: {}
